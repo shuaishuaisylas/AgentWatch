@@ -19,7 +19,7 @@ WORKBUDDY_CREDIT_URL = "https://www.workbuddy.cn/openapi/v2/credit"
 
 
 def numeric(value):
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value < 1e15:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < 1e15 and math.isfinite(value):
         return value
     return None
 

@@ -56,7 +56,7 @@ class SubscriptionTests(unittest.TestCase):
         self.assertEqual({w["bucket"]: w["remaining"] for w in limits}, {"codex": 75, "codex-other": 40})
 
     def test_invalid_or_missing_percent_does_not_become_zero(self):
-        for invalid in [None, True, "20", -1, 101, float("nan"), float("inf")]:
+        for invalid in [None, True, "20", -1, 101, 10**400, float("nan"), float("inf")]:
             self.assertEqual(claude_windows({"seven_day": {"used_percentage": invalid}}), [])
         for used, remaining in [(0, 100), (100, 0)]:
             self.codex(used)
