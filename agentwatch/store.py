@@ -30,6 +30,8 @@ class Store:
               context_estimated INTEGER DEFAULT 0, context_invalid_at REAL DEFAULT 0,
               reported_input INTEGER, reported_output INTEGER, reported_cache_read INTEGER, reported_cache_write INTEGER,
               reported_total INTEGER, coverage TEXT DEFAULT 'observed', last_hook_at REAL,
+              archived INTEGER NOT NULL DEFAULT 0, archive_source TEXT NOT NULL DEFAULT '',
+              internal INTEGER NOT NULL DEFAULT 0,
               seen_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS usage (
@@ -67,6 +69,23 @@ class Store:
               PRIMARY KEY(tool,bucket)
             );
         """)
+        # Existing installations keep their sessions, aliases, usage and cursors.
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(sessions)")}
+        for name, declaration in [("archived", "INTEGER NOT NULL DEFAULT 0"),
+                                  ("archive_source", "TEXT NOT NULL DEFAULT ''"),
+                                  ("internal", "INTEGER NOT NULL DEFAULT 0")]:
+            if name not in columns:
+                self.db.execute("ALTER TABLE sessions ADD COLUMN " + name + " " + declaration)
+        self.db.executescript("""
+            CREATE INDEX IF NOT EXISTS sessions_parent ON sessions(parent_id);
+            CREATE VIEW IF NOT EXISTS visible_sessions AS
+              WITH RECURSIVE hidden(id) AS (
+                SELECT id FROM sessions WHERE archived=1 OR internal=1
+                UNION
+                SELECT s.id FROM sessions s JOIN hidden h ON s.parent_id=h.id WHERE s.role='child'
+              )
+              SELECT s.* FROM sessions s WHERE s.id NOT IN (SELECT id FROM hidden);
+        """)
         os.chmod(self.path, 0o600)
         self.db.commit()
 
@@ -88,7 +107,7 @@ class Store:
             "alias", "started_at", "last_event_at", "state", "stage", "state_at", "state_source", "liveness", "pid",
             "process_birth", "tty", "context_used", "context_limit", "context_at", "context_estimated", "context_invalid_at",
             "reported_input", "reported_output", "reported_cache_read", "reported_cache_write", "reported_total",
-            "coverage", "last_hook_at", "seen_at",
+            "coverage", "last_hook_at", "seen_at", "archived", "archive_source", "internal",
         }
         values = {k: v for k, v in values.items() if k in allowed}
         if values:
@@ -204,7 +223,7 @@ class Store:
         period, start, end, _ = period_bounds("day", day_of(current))
         where, values = self.select_filter(args)
         with self.lock:
-            rows = self.db.execute("SELECT s.* FROM sessions s WHERE " + where + " AND (s.last_event_at>=? OR s.liveness='online') ORDER BY s.last_event_at DESC", (*values, start.timestamp())).fetchall()
+            rows = self.db.execute("SELECT s.* FROM visible_sessions s WHERE " + where + " AND (s.last_event_at>=? OR s.liveness='online') ORDER BY s.last_event_at DESC", (*values, start.timestamp())).fetchall()
             cards = []
             priority = {"waiting_approval": 0, "waiting_user": 0, "error": 1, "active": 2, "unknown": 3, "idle": 4, "ended": 5}
             for r in rows:
@@ -223,13 +242,13 @@ class Store:
                 card["context_percent"] = used / limit * 100 if used is not None and limit and limit > 0 else None
                 card["jump"] = self.jump_info(card)
                 card["worktree_name"] = Path(card["worktree"]).name if card["worktree"] else None
-                for key in ["cwd", "worktree", "pid", "process_birth", "tty", "reported_input", "reported_output", "reported_cache_read", "reported_cache_write", "reported_total"]:
+                for key in ["cwd", "worktree", "pid", "process_birth", "tty", "reported_input", "reported_output", "reported_cache_read", "reported_cache_write", "reported_total", "archived", "archive_source", "internal"]:
                     card.pop(key, None)
                 cards.append(card)
             cards.sort(key=lambda c: (priority.get(c["state"], 3), -(c["last_event_at"] or 0)))
-            activity = [dict(r) for r in self.db.execute("SELECT a.id,a.at,a.kind,a.label,s.tool,s.source_id,s.project_name,s.id AS session_id FROM activity a JOIN sessions s ON s.id=a.session_id WHERE " + where + " AND a.at>=? AND a.at<? ORDER BY a.at DESC LIMIT 24", (*values, start.timestamp(), end.timestamp()))]
+            activity = [dict(r) for r in self.db.execute("SELECT a.id,a.at,a.kind,a.label,s.tool,s.source_id,s.project_name,s.id AS session_id FROM activity a JOIN visible_sessions s ON s.id=a.session_id WHERE " + where + " AND a.at>=? AND a.at<? ORDER BY a.at DESC LIMIT 24", (*values, start.timestamp(), end.timestamp()))]
             projects = [dict(r) for r in self.db.execute("SELECT project_id AS id,project_name AS name,COUNT(*) AS sessions FROM sessions GROUP BY project_id,project_name ORDER BY project_name")]
-            unknown_roles = self.db.execute("SELECT COUNT(*) FROM sessions WHERE role='unknown' AND last_event_at>=?", (start.timestamp(),)).fetchone()[0]
+            unknown_roles = self.db.execute("SELECT COUNT(*) FROM visible_sessions WHERE role='unknown' AND last_event_at>=?", (start.timestamp(),)).fetchone()[0]
         counts = {"observed": len(cards), "online": sum(c["liveness"] == "online" for c in cards),
                   "active": sum(c["state"] == "active" and not c["stale"] and c["liveness"] == "online" for c in cards),
                   "waiting": sum(c["state"] in ["waiting_user", "waiting_approval"] for c in cards),

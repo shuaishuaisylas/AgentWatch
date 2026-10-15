@@ -8,10 +8,26 @@ import sqlite3
 import subprocess
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 
 from .common import fingerprint, now, number, safe_id, short_text, timestamp
 from .subscriptions import backfill_codex, record_claude, record_codex
+
+
+def codex_source(value):
+    if isinstance(value, str) and value.startswith("{"):
+        try:
+            return json.loads(value)
+        except ValueError:
+            pass
+    return value
+
+
+def internal_codex(source, thread_source=None):
+    source = codex_source(source)
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    return thread_source == "guardian_review" or (isinstance(subagent, dict) and subagent.get("other") == "guardian")
 
 
 def surface_for(originator="", executable="", tty=None):
@@ -78,7 +94,7 @@ class RecordParser:
             sid = fallback_sid or self.store.session("codex", payload.get("id"))
             if sid:
                 cursor["sid"] = sid
-                source = payload.get("source")
+                source = codex_source(payload.get("source"))
                 role = "child" if isinstance(source, dict) and "subagent" in source else "main" if isinstance(source, str) and source in ["cli", "vscode", "exec", "appServer"] else "unknown"
                 parent = payload.get("forked_from_id") or payload.get("parent_thread_id")
                 if isinstance(source, dict):
@@ -88,6 +104,8 @@ class RecordParser:
                         if isinstance(spawn, dict):
                             parent = spawn.get("parent_thread_id") or parent
                 values = {"version": payload.get("cli_version", ""), "role": role}
+                if internal_codex(source, payload.get("thread_source")):
+                    values["internal"] = 1
                 if safe_id(parent):
                     values["parent_id"] = "codex:" + parent
                 surface = surface_for(payload.get("originator", ""))
@@ -409,6 +427,7 @@ class Collector:
         self.wake = threading.Event()
         self.thread = None
         self.discovered = {}
+        self.codex_archive_states = {}
         self.last_discovery = self.last_probe = 0
         self.quota_bootstrapped = False
         self.status = {"running": False, "files": 0, "pending": 0, "read_bytes": 0, "last_scan": None, "errors": 0}
@@ -451,49 +470,50 @@ class Collector:
     def discover(self):
         files = {}
         excluded = set()
+        self.codex_archive_states = {}
         index = self.codex_home / "state_5.sqlite"
         if index.exists():
             try:
-                db = sqlite3.connect(index.as_uri() + "?mode=ro", uri=True, timeout=2)
-                db.row_factory = sqlite3.Row
-                cols = {r[1] for r in db.execute("PRAGMA table_info(threads)")}
-                wanted = [c for c in ["id", "rollout_path", "cwd", "source", "originator", "cli_version", "git_branch", "created_at", "created_at_ms"] if c in cols]
-                rows = db.execute("SELECT " + ",".join(wanted) + " FROM threads").fetchall()
-                with self.store.lock, self.store.db:
-                    for raw in rows:
-                        r = dict(raw)
-                        if "chrome" in (r.get("originator") or "").lower():
-                            if r.get("rollout_path"):
-                                excluded.add(str(Path(r["rollout_path"]).resolve()))
-                            continue
-                        source_id = safe_id(r.get("id"))
-                        path = Path(r.get("rollout_path") or "")
-                        if not source_id or not self.permitted(path) or path.suffix != ".jsonl" or not path.is_file():
-                            continue
-                        sid = self.store.session("codex", source_id)
-                        src = r.get("source")
-                        role = "unknown"
-                        if src in ["vscode", "cli", "exec", "appServer"]:
-                            role = "main"
-                        elif isinstance(src, str) and src.startswith("{"):
-                            try:
-                                parsed = json.loads(src)
-                                if isinstance(parsed, dict) and "subagent" in parsed:
-                                    role = "child"
-                            except ValueError:
-                                pass
-                        surface = surface_for(r.get("originator") or "")
-                        values = {"surface": surface} if surface != "unknown" else {}
-                        self.store.metadata(sid, r.get("cwd"), **values, role=role,
-                                            version=r.get("cli_version") or "", branch=r.get("git_branch") or "",
-                                            started_at=timestamp(r.get("created_at_ms") or r.get("created_at")))
-                        files[str(path.resolve())] = ("codex", sid)
-                    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                    if "thread_spawn_edges" in tables:
-                        for parent, child in db.execute("SELECT parent_thread_id,child_thread_id FROM thread_spawn_edges"):
-                            if safe_id(parent) and safe_id(child):
-                                self.store.update("codex:" + child, {"parent_id": "codex:" + parent, "role": "child"})
-                db.close()
+                with closing(sqlite3.connect(index.as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
+                    db.row_factory = sqlite3.Row
+                    cols = {r[1] for r in db.execute("PRAGMA table_info(threads)")}
+                    wanted = [c for c in ["id", "rollout_path", "cwd", "source", "originator", "cli_version", "git_branch", "created_at", "created_at_ms", "archived", "thread_source"] if c in cols]
+                    rows = db.execute("SELECT " + ",".join(wanted) + " FROM threads").fetchall()
+                    with self.store.lock, self.store.db:
+                        for raw in rows:
+                            r = dict(raw)
+                            if "chrome" in (r.get("originator") or "").lower():
+                                if r.get("rollout_path"):
+                                    excluded.add(str(Path(r["rollout_path"]).resolve()))
+                                continue
+                            source_id = safe_id(r.get("id"))
+                            if not source_id:
+                                continue
+                            sid = self.store.session("codex", source_id)
+                            src = codex_source(r.get("source"))
+                            role = "child" if isinstance(src, dict) and "subagent" in src else "main" if isinstance(src, str) and src in ["vscode", "cli", "exec", "appServer"] else "unknown"
+                            surface = surface_for(r.get("originator") or "")
+                            values = {"surface": surface} if surface != "unknown" else {}
+                            if "source" in r or "thread_source" in r:
+                                values["internal"] = int(internal_codex(src, r.get("thread_source")))
+                            if r.get("archived") in (0, 1):
+                                self.codex_archive_states[sid] = int(r["archived"])
+                                values.update(archived=int(r["archived"]), archive_source="index")
+                            if isinstance(src, dict) and isinstance(src.get("subagent"), dict):
+                                spawn = src["subagent"].get("thread_spawn", {})
+                                if isinstance(spawn, dict) and safe_id(spawn.get("parent_thread_id")):
+                                    values["parent_id"] = "codex:" + spawn["parent_thread_id"]
+                            self.store.metadata(sid, r.get("cwd"), **values, role=role,
+                                                version=r.get("cli_version") or "", branch=r.get("git_branch") or "",
+                                                started_at=timestamp(r.get("created_at_ms") or r.get("created_at")))
+                            path = Path(r.get("rollout_path") or "")
+                            if self.permitted(path) and path.suffix == ".jsonl" and path.is_file():
+                                files[str(path.resolve())] = ("codex", sid)
+                        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                        if "thread_spawn_edges" in tables:
+                            for parent, child in db.execute("SELECT parent_thread_id,child_thread_id FROM thread_spawn_edges"):
+                                if safe_id(parent) and safe_id(child):
+                                    self.store.update("codex:" + child, {"parent_id": "codex:" + parent, "role": "child"})
             except (sqlite3.Error, OSError):
                 self.status["errors"] += 1
         for root, tool in [(self.codex_home / "sessions", "codex"), (self.codex_home / "archived_sessions", "codex"), (self.claude_home / "projects", "claude"), (self.desktop_home / "claude-code-sessions", "claude")]:
@@ -528,12 +548,36 @@ class Collector:
             except (ValueError, OSError, UnicodeError):
                 self.status["errors"] += 1
         self.discovered = files
+        self.sync_codex_archives()
         if not self.quota_bootstrapped:
             with self.store.lock, self.store.db:
                 backfill_codex(self.store, files)
             self.quota_bootstrapped = True
         self.status["files"] = len(files)
         self.last_discovery = now()
+
+    def sync_codex_archives(self):
+        # A moved transcript may already be at EOF. Visibility must be refreshed
+        # independently of whether new events or usage were appended.
+        archived_root = (self.codex_home / "archived_sessions").resolve()
+        active_root = (self.codex_home / "sessions").resolve()
+        with self.store.lock, self.store.db:
+            saved = {r["path"]: r["session_id"] for r in self.store.db.execute("SELECT path,session_id FROM files WHERE tool='codex'")}
+            paths = {}
+            for path, (tool, fallback_sid) in self.discovered.items():
+                sid = fallback_sid or saved.get(path)
+                if tool != "codex" or not sid or sid in self.codex_archive_states:
+                    continue
+                parent = Path(path).parent
+                archived = parent == archived_root or archived_root in parent.parents
+                active = parent == active_root or active_root in parent.parents
+                if archived or active:
+                    paths[sid] = paths.get(sid, False) or archived
+            for sid, archived in paths.items():
+                row = self.store.db.execute("SELECT archive_source FROM sessions WHERE id=?", (sid,)).fetchone()
+                # An unavailable index must not undo its last confirmed archive.
+                if row and (archived or row["archive_source"] != "index"):
+                    self.store.update(sid, {"archived": int(archived), "archive_source": "path"})
 
     def read_file(self, path, tool, fallback_sid, budget=512_000):
         if tool == "workbuddy" and not self.permitted_workbuddy(path):
@@ -675,6 +719,7 @@ class Collector:
                 except (OSError, ValueError, sqlite3.Error):
                     self.status["errors"] += 1
             self.status.update(pending=pending, read_bytes=self.status["read_bytes"] + spent, last_scan=now())
+            self.sync_codex_archives()
             if force or now() - self.last_probe > 8:
                 self.probe()
             # Only activity labels, never source records, expire at the local day boundary.

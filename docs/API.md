@@ -61,6 +61,10 @@ snapshot/stats 共用筛选：
 
 stats 另支持 `period=day|week|month|year`（默认 day）、`date=YYYY-MM-DD`（默认北京时间今天）。非法日期或周期回落到服务端默认值，前端仍应传有效值。snapshot 固定为今日/在线范围，不接收历史周期；历史数据到 stats 查询。
 
+Codex 已归档会话及其所有后代不进入实时会话、计数或动态，即使共享进程仍在线；内部审核会话（`guardian_review` / `subagent.other=guardian`）同样隐藏，正常子 Agent 保留。归档以本地索引的明确标记为准；索引缺少此字段时可从 `archived_sessions` 目录识别。索引暂时不可用时，不撤销上次已确认的归档。常规每 20 秒重新发现，`/api/rescan` 可请求提前刷新；恢复归档后在下一次发现时重新展示。来源数据库与记录均保持只读。
+
+隐藏只影响实时可见性，不删除会话、别名、采集游标或用量；`stats` 和 `snapshot.today` 保留已归档会话的历史统计。`projects` 继续提供历史项目，方便按项目查历史；不能用历史会话数判断当前可见数量。
+
 ### `GET /api/snapshot?tool=all&project=all&role=all`
 
 主要结构：
@@ -112,7 +116,7 @@ stats 另支持 `period=day|week|month|year`（默认 day）、`date=YYYY-MM-DD`
 
 示例省略了若干会话元数据；`today` 的实际内容与同筛选的当日 stats 结构相同。会话标题优先使用人工 `alias`，否则显示项目名；不要从原始对话生成标题。
 
-- `counts` 基于筛选后、截断前的会话计算；最多返回最优先的 160 张卡片，`truncated=true` 时提示缩小范围。`unknown_roles` 是全局今日关系未知计数，不代表当前工具/项目内的数量。
+- `counts` 基于筛选后、截断前的可见会话计算；最多返回最优先的 160 张卡片，`truncated=true` 时提示缩小范围。`unknown_roles` 是全局今日可见且关系未知的计数，不代表当前工具/项目内的数量。
 - `projects` 是已采集项目列表，不限当前筛选；`activity` 返回当前筛选内今日最近 24 条，字段含 `id`、`at`、`kind`、`label`、`tool`、`project_name`、`session_id`。
 - `usage.today` 是北京时间当天已采集总量；`observed_total` 为看板已采集累计。`cumulative` 优先显示来源报告累计，可能高于 `observed_total`，两者不能互相替代。
 - 仅当 `context_percent` 有效时绘制百分比；`context_used` 有值但分母未知时只展示 token 数。WorkBuddy 不提供上下文快照。
