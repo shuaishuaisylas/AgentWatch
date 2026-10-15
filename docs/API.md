@@ -192,6 +192,8 @@ Codex 已归档会话及其所有后代不进入实时会话、计数或动态�
 
 Codex 来源为 `codex_record`，Claude 为 `claude_statusline`，WorkBuddy 正式数据为 `workbuddy_openapi`。它们是最近本机会话/正式凭证对应的账号快照，无法保证切换账号后仍代表当前账号。演示顶层 demo=true，所有数据为人工样例，凭证被忽略且不联网。
 
+Claude 当前仅采集来源报告的 `five_hour`、`seven_day` 订阅窗口；未报告时保持未知。API/第三方余额及网关 `spend_limit` 尚未接入，不能由会话 token 估算，也不能混为订阅额度。
+
 “更新额度”调用已有 `POST /api/rescan`，仅表示已请求采集/后台查询；WorkBuddy 最短间隔 30 秒，常规每 300 秒查询，页面持续读取缓存。缺少 WorkBuddy 凭证不发请求，也不复用之前进程的积分缓存。凭证配置和官方链接见 README。
 
 ## 写入与操作接口

@@ -194,7 +194,7 @@ class Subscriptions:
         current = current or now()
         notices = {
             "codex": "来自本地会话最近上报的账号额度；不是会话 token 累计。账号切换后请以原客户端为准。",
-            "claude": "需在接入设置启用终端状态栏上报，并由新 Claude Code 会话完成一次回复；只显示来源实际报告的窗口。",
+            "claude": "需启用终端状态栏，并由 Pro/Max 会话实际报告订阅窗口；API/第三方余额尚未接入，未报告时保持未知。",
             "workbuddy": "需官方 user.credit.readable 授权凭证；积分合并订阅、充值及赠送资源包，不代表周订阅额度。"}
         with self.store.lock:
             rows = [dict(r) for r in self.store.db.execute("SELECT * FROM subscription_snapshots ORDER BY tool,bucket")]
