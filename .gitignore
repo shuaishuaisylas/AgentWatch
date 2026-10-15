@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+.data/
+.qa/
+.DS_Store
+.venv/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+*.jsonl
+config-backups/
+.agentwatch-data/
+# Local research / verification notes contain machine-specific metadata.
+/本机Agent看板_*.md
+/验证记录_*.md
+

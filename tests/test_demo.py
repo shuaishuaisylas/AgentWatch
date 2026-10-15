@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import io
+import json
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from agentwatch import __main__ as entrypoint
+from agentwatch.common import day_of, now
+from agentwatch.demo import DemoEnvironment
+from agentwatch.server import Handler
+
+
+class DemoTests(unittest.TestCase):
+    def setUp(self):
+        self.environment = DemoEnvironment()
+        self.demo = self.environment.__enter__()
+        self.server = SimpleNamespace(demo=True, store=self.demo.store,
+                                      collector=self.demo.collector, config=self.demo.config)
+
+    def tearDown(self):
+        self.environment.__exit__(None, None, None)
+
+    def dispatch(self, path, body=None):
+        """Exercise real route handling without binding a network port."""
+        handler = Handler.__new__(Handler)
+        handler.server, handler.path = self.server, path
+        handler.trust = lambda: True
+        handler.authorized = lambda **options: True
+        responses = []
+        handler.json_response = lambda status, value: responses.append((status, value))
+        raw = json.dumps(body).encode() if body is not None else b""
+        handler.rfile = io.BytesIO(raw)
+        handler.headers = {"Content-Length": str(len(raw))}
+        handler.do_GET() if body is None else handler.do_POST()
+        self.assertEqual(len(responses), 1)
+        return responses[0]
+
+    def test_all_source_roots_and_database_are_temporary_and_no_real_collector_runs(self):
+        collector = self.demo.collector
+        for path in [collector.codex_home, collector.claude_home, collector.desktop_home,
+                     collector.workbuddy_home, self.demo.store.path]:
+            self.assertTrue(path.is_relative_to(self.demo.root))
+            self.assertTrue(path.exists())
+        with patch("agentwatch.collector.process_inventory", side_effect=AssertionError("real processes")), \
+             patch("agentwatch.collector.Collector.discover", side_effect=AssertionError("real records")), \
+             patch("agentwatch.configuration.ClaudeConfiguration.read", side_effect=AssertionError("real settings")):
+            collector.start()
+            collector.scan(force=True)
+            collector.stop()
+            status, integrations = self.dispatch("/api/integrations")
+        self.assertEqual(status, 200)
+        self.assertTrue(integrations["demo"])
+        self.assertTrue(all(source["present"] for source in integrations["sources"]))
+        self.assertEqual(collector.status["files"], 0)
+        self.assertEqual(collector.status["read_bytes"], 0)
+        self.assertIn("人工", integrations["privacy"])
+
+    def test_sample_states_roles_context_and_history_have_explicit_demo_identity(self):
+        status, snapshot = self.dispatch("/api/snapshot?role=all")
+        self.assertEqual(status, 200)
+        self.assertTrue(snapshot["demo"])
+        cards = snapshot["sessions"]
+        self.assertEqual({card["tool"] for card in cards}, {"codex", "claude", "workbuddy"})
+        self.assertEqual({card["role"] for card in cards}, {"main", "child", "unknown"})
+        self.assertEqual({card["state"] for card in cards},
+                         {"active", "waiting_user", "waiting_approval", "error", "idle", "unknown"})
+        self.assertTrue(any(card["context_percent"] is None for card in cards))
+        self.assertTrue(any(card["context_percent"] is not None and not card["context_stale"] for card in cards))
+        self.assertTrue(any(card["context_stale"] for card in cards))
+        self.assertTrue(all(not card["jump"]["available"] for card in cards))
+        status, stats = self.dispatch("/api/stats?role=all&period=month&date=" + day_of(now()))
+        self.assertEqual(status, 200)
+        self.assertGreater(stats["totals"]["total"], 0)
+        # The first day of a month legitimately has one populated month bucket.
+        history_days = self.demo.store.db.execute("SELECT COUNT(DISTINCT day) FROM usage").fetchone()[0]
+        self.assertGreaterEqual(history_days, 30)
+
+    def test_refresh_keeps_active_sample_live_without_making_old_context_fresh(self):
+        future = now() + 600
+        with patch("agentwatch.demo.now", return_value=future), patch("agentwatch.store.now", return_value=future):
+            self.demo.collector.refresh()
+            snapshot = self.demo.store.snapshot({"role": "all"}, {}, future)
+        active = next(card for card in snapshot["sessions"] if card["id"] == "codex:demo-design")
+        old = next(card for card in snapshot["sessions"] if card["id"] == "codex:demo-error")
+        self.assertEqual(active["state"], "active")
+        self.assertFalse(active["stale"])
+        self.assertTrue(old["context_stale"])
+
+    def test_real_navigation_and_claude_configuration_routes_are_forbidden(self):
+        with patch("agentwatch.server.jump", side_effect=AssertionError("real navigation")), \
+             patch("agentwatch.configuration.ClaudeConfiguration.install", side_effect=AssertionError("real settings")):
+            for path in ["/api/jump", "/api/claude/preview", "/api/claude/enable", "/api/claude/restore"]:
+                status, payload = self.dispatch(path, {"id": "codex:demo-design", "kind": "codex"})
+                self.assertEqual(status, 403)
+                self.assertTrue(payload["demo"])
+                self.assertIn("演示", payload["error"])
+
+    def test_alias_and_refresh_only_change_temporary_samples(self):
+        status, payload = self.dispatch("/api/alias", {"id": "codex:demo-design", "alias": "合作者测试名称"})
+        self.assertEqual((status, payload["saved"]), (200, True))
+        self.assertEqual(self.dispatch("/api/rescan", {})[0], 200)
+        status, snapshot = self.dispatch("/api/snapshot?role=all")
+        card = next(card for card in snapshot["sessions"] if card["id"] == "codex:demo-design")
+        self.assertEqual(card["alias"], "合作者测试名称")
+
+
+class DemoLifecycleTests(unittest.TestCase):
+    def test_context_exit_removes_database_and_source_roots(self):
+        with DemoEnvironment() as demo:
+            root = demo.root
+            self.assertTrue(demo.store.path.exists())
+        self.assertFalse(root.exists())
+
+    def test_cli_demo_ignores_real_paths_and_runs_requested_port_and_browser_mode(self):
+        observed = {}
+        class FakeServer:
+            def __init__(self, port, store, collector, config):
+                self.server_port = port
+                observed.update(port=port, root=collector.codex_home.parents[1], store=store,
+                                collector=collector, config=config)
+            def serve_forever(self, **options):
+                observed["tools"] = {row["tool"] for row in observed["store"].all_sessions()}
+            def server_close(self):
+                observed["closed"] = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            forbidden = Path(directory) / "must-not-create"
+            argv = ["agentwatch", "--demo", "--port", "8767", "--open", "--data-dir", str(forbidden),
+                    "--codex-home", str(forbidden), "--claude-home", str(forbidden),
+                    "--desktop-home", str(forbidden), "--workbuddy-home", str(forbidden)]
+            with patch("sys.argv", argv), patch.object(entrypoint, "AppServer", FakeServer), \
+                 patch.object(entrypoint, "Collector", side_effect=AssertionError("production collector")), \
+                 patch.object(entrypoint, "ClaudeConfiguration", side_effect=AssertionError("production config")), \
+                 patch.object(entrypoint, "private_dir", side_effect=AssertionError("production data")), \
+                 patch.object(entrypoint.signal, "signal"), patch.object(entrypoint.threading, "Timer") as timer, \
+                 redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(entrypoint.main(), 0)
+            self.assertFalse(forbidden.exists())
+        self.assertEqual(observed["port"], 8767)
+        self.assertEqual(observed["tools"], {"codex", "claude", "workbuddy"})
+        self.assertTrue(observed["closed"])
+        self.assertFalse(observed["root"].exists())
+        timer.assert_called_once()
+        timer.return_value.start.assert_called_once()
+        self.assertIn("演示模式", output.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

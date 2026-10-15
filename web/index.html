@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf" content="__CSRF__">
+  <meta name="description" content="本机 Agent 会话、状态与用量看板">
+  <title>AgentWatch · 本机 Agent 看板</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="AgentWatch 首页"><span class="brand-mark"><i></i><i></i><i></i></span><span>Agent<span class="brand-light">Watch</span></span></a>
+      <div class="workspace-label">个人工作台 <span>LOCAL</span></div>
+      <nav aria-label="看板导航">
+        <button class="nav-item selected" data-view="live"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg>会话总览 <span id="nav-count">—</span></button>
+        <button class="nav-item" data-view="history"><svg viewBox="0 0 24 24"><path d="M4 20V10M12 20V4M20 20v-7"/></svg>历史统计</button>
+        <button class="nav-item" data-view="settings"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="16" cy="17" r="3"/></svg>接入设置 <span id="setup-dot" class="setup-dot"></span></button>
+      </nav>
+      <div class="sidebar-section">本机采集来源</div>
+      <div id="tool-sources"></div>
+      <div class="sidebar-bottom"><div><span class="lock-icon">◇</span> 数据留在本机</div><small>北京时间 · Asia/Shanghai</small><div class="version">AGENTWATCH <span>v0.1</span></div></div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div class="breadcrumb">工作台 <span>/</span> <strong id="breadcrumb">会话总览</strong></div>
+        <div class="island" aria-label="实时总览"><span class="island-symbol">≋</span><span id="island-online">连接本机</span><span class="island-divider"></span><span id="island-waiting">同步中</span><span class="live-dot"></span></div>
+        <div class="connection"><span class="small-dot" id="connection-dot"></span><span id="connection-text">正在连接</span></div>
+      </header>
+      <div class="page-content">
+        <div class="notice" id="demo-banner" role="status" hidden>演示模式 · 全部为人工样例，不读取本机 Agent 数据；应用跳转和配置修改已停用。</div>
+        <div class="page-heading"><div><div class="eyebrow" id="eyebrow">YOUR AGENTS, AT A GLANCE</div><h1 id="page-title">每个会话，都在视线里。</h1><p id="page-description">先看谁需要你，再看状态与用量。</p></div><button class="button secondary" id="refresh"><span>↻</span> 刷新数据</button></div>
+        <div class="filterbar" id="filterbar"><div class="filter-field"><label for="tool-filter">工具</label><select id="tool-filter"><option value="all">全部工具</option></select></div><div class="filter-field"><label for="project-filter">项目</label><select id="project-filter"><option value="all">全部项目</option></select></div><div class="filter-field"><label for="role-filter">会话范围</label><select id="role-filter"><option value="all">全部会话</option><option value="main">主会话</option><option value="child">子 Agent</option><option value="unknown">关系未知</option></select></div><div class="snapshot-time" id="snapshot-time">等待首次采集</div></div>
+
+        <section id="view-live" class="view">
+          <div class="metrics" id="live-metrics"><div class="loading-block">正在读取本机会话…</div></div>
+          <div id="coverage-banner" class="notice" hidden></div>
+          <div class="section-heading"><div><h2>当前会话 <span id="session-count">—</span></h2><p>当前在线与今日有活动的会话</p></div><div class="state-tabs" aria-label="状态筛选"><button class="selected" data-state="all">全部</button><button data-state="waiting">需要处理 <span id="waiting-tab-count">0</span></button><button data-state="active">执行中</button><button data-state="unknown">待确认</button></div></div>
+          <div class="session-grid" id="sessions"><div class="empty-state"><div class="empty-symbol">⌁</div><h3>正在发现你的 Agent</h3><p>保留原来的启动方式，看板会读取可观测的本机会话。</p></div></div>
+          <section class="activity-panel"><div class="section-heading compact"><div><h2>今日动态</h2><p>只展示状态变化，不展示对话内容</p></div><span id="activity-date" class="muted">—</span></div><div id="activity"><div class="empty-small">等待状态事件</div></div></section>
+        </section>
+
+        <section id="view-history" class="view" hidden>
+          <div class="history-controls"><div class="period-tabs" aria-label="统计周期"><button data-period="day" class="selected">日</button><button data-period="week">周</button><button data-period="month">月</button><button data-period="year">年</button></div><div class="date-control"><button id="date-prev" aria-label="上一个周期">‹</button><input type="date" id="stats-date" aria-label="统计日期"><button id="date-next" aria-label="下一个周期">›</button></div><span id="period-range" class="muted">—</span></div>
+          <div class="metrics history-metrics" id="history-metrics"></div>
+          <div class="chart-panel"><div class="section-heading compact"><div><h2>Token 使用趋势</h2><p>按事件所属时间统计，缓存分项不重复相加</p></div><span id="chart-total" class="chart-total">—</span></div><div id="chart" class="chart"></div><div id="chart-labels" class="chart-labels"></div><div class="chart-legend"><span class="legend-dot"></span> 已采集 token <span id="history-coverage" class="muted"></span></div></div>
+          <div class="history-bottom"><div class="breakdown-panel"><h2>用量组成</h2><p class="muted">输入含已报告的缓存分项；输出含已报告的推理分项。</p><div id="breakdown"></div></div><div class="breakdown-panel"><h2>按工具统计</h2><p class="muted">当前筛选范围，使用相同的日期窗口。</p><div id="by-tool"></div></div></div>
+          <div class="footnote">会话数在所选周期内去重。活动轮次与任务分别统计；任务只计入有可靠身份的来源。缺失的用量显示“—”，不会补零。</div>
+        </section>
+
+        <section id="view-settings" class="view" hidden>
+          <div class="settings-intro"><span class="privacy-badge">◇ LOCAL FIRST</span><h2>按你原来的方式使用 Agent。</h2><p>看板从本机记录发现会话。首次启用增强后，Claude 会主动告诉看板：它在处理需求，还是在等你。</p></div>
+          <div id="source-panels" class="source-panels"></div>
+          <div class="enhance-panel"><div class="enhance-heading"><span class="tool-icon claude large">✳</span><div><h2>Claude Code 准确状态</h2><p>区分正在执行、等待批准、等待回复与本轮结束。</p></div><span id="enhance-status" class="status-chip unknown">读取设置中</span></div><div class="enhance-content"><p>新增后台状态上报，保留现有设置。启用前可查看新增内容；系统会备份，之后可以撤销。</p><label class="checkbox-row"><input type="checkbox" id="include-statusline"><span>同时上报终端上下文占用<small>保留已有状态栏的输出；没有状态栏时添加一条简短显示。</small></span></label><div class="enhance-actions"><button class="button primary" id="enable-claude">预览并启用</button><button class="button secondary" id="restore-claude" hidden>撤销 AgentWatch 设置</button><span id="hook-last-seen" class="muted"></span></div><div class="settings-note">已启动的会话不一定会重新读取设置。启用后，新启动的本机 Claude Code 会话开始上报；终端、VS Code 和桌面 Code 以各自实际生效情况为准。</div></div></div>
+          <div class="settings-bottom"><div><h3>只保留必要信息</h3><p>会话身份、项目、状态与数字用量。不会保存提示词、回复、代码、工具参数或凭据。</p><div class="data-location" id="data-location"></div></div><div><h3>采集边界</h3><p>本版本接入 Codex、Claude Code 与 WorkBuddy 本地记录。WorkBuddy 积分余额与精准等待状态尚未接入；豆包工作、Claude Cowork 和普通 Chat 尚未接入。</p></div></div>
+        </section>
+        <footer><span>所有数字仅代表看板可观测范围</span><span>AgentWatch <span class="footer-dot">·</span> 本机 Agent 看板</span></footer>
+      </div>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="modal"><div class="modal-heading"><h2 id="modal-title"></h2><button class="icon-button" id="modal-close" aria-label="关闭">×</button></div><div id="modal-body"></div><div id="modal-actions" class="modal-actions"></div></dialog>
+</body>
+</html>
