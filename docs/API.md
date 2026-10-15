@@ -127,6 +127,7 @@ Codex 已归档会话及其所有后代不进入实时会话、计数或动态�
 - `usage.today` 是北京时间当天已采集总量；`observed_total` 为看板已采集累计。`cumulative` 优先显示来源报告累计，可能高于 `observed_total`，两者不能互相替代。
 - 仅当 `context_percent` 有效时绘制百分比；`context_used` 有值但分母未知时只展示 token 数。WorkBuddy 不提供上下文快照。
 - `state_source` 包括本地记录 `record`、明确事件 `event`、Codex / Claude / WorkBuddy 上报 `hook`、进程观测 `process`；演示可能为 `demo`，不能把它当真实来源。来源已使用 hooks 后，原始记录不覆盖其状态。
+- Claude 的 `AskUserQuestion` / `ExitPlanMode` 在 `PreToolUse`、`PermissionRequest` 及明确带工具名的权限通知中归为 `waiting_user`。VS Code 等宿主可能稍后发出不带工具身份的 `permission_prompt`；仅在仍有已确认提问关联且当前状态未离开等待回复时保留原分类和原状态时间，不把通知当作新的提问证据。新工具、明确命令审批、回复结束或其他明确状态转换清除关联，真正的权限请求仍为 `waiting_approval`。关联只含工具名、工具 ID 和时间，支持看板重启，不保存问题或回答。没有工具 ID 的迟到请求及任意并行交互不能据此宣称全部解决。字段依据见 [Claude 官方 hooks](https://code.claude.com/docs/en/hooks#permissionrequest)。
 - WorkBuddy 桌面沙箱批准通过 SDK 状态机日志补充，来源为 `event`。只接受明确的转换信号，`PERMISSION_REQUESTED` 对应待批准，`PERMISSION_RESOLVED` 对应继续执行，`TURN_COMPLETED` 对应本轮空闲；不能把工具返回或 `PHASE_IDLE` 当成整轮结束。提问工具的 hook 可细分为等待回复。已收到明确 hook/event 后，普通记录不能降级覆盖它；桌面会话有原生状态来源时，CLI 工作进程退出不会将整条会话改成运行结束。
 - `coverage` 当前可能为 `observed`、`status_only`、`partial_baseline`、`counter_reset`、`partial_usage`、`partial_records`、`missing_time`、`missing_request_id`；新增值应有通用显示回退。`status_only` 表示 Codex 已上报状态，但尚未关联已解析的会话记录，不表示 token 为 0，也不证明会话可恢复。
 - `working_directory` 是识别到的项目根目录或工作树路径，字符串或 null；本机用户主目录缩为 `~`。它不是每次命令执行的当前子目录。`worktree_name` 保持兼容，前端优先显示新字段，旧后端缺失时回退到工作树名或未知。

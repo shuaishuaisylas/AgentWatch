@@ -347,6 +347,94 @@ class StateTests(Fixture):
         self.assertEqual(result["tasks"],1)
         self.assertNotIn(SECRET,"\n".join(self.store.db.iterdump()))
 
+    def test_claude_interactive_permission_waits_for_reply_until_answered(self):
+        for index, name in enumerate(["AskUserQuestion", "ExitPlanMode"]):
+            with self.subTest(tool=name):
+                at = AT + index * 10
+                self.hook("PreToolUse",at,tool_name=name,tool_use_id="question"+str(index))
+                # Official PermissionRequest payloads need not include a tool ID.
+                clean = sanitize({"session_id":"session2", "hook_event_name":"PermissionRequest",
+                                  "tool_name":name, "tool_input":SECRET},at=at+1)
+                sid = self.parser.hook(clean,{})
+                self.hook("Notification",at+2,notification_type="permission_prompt",tool_name=name)
+                card = self.store.snapshot({"role":"all"},{},at+3)["sessions"][0]
+                self.assertEqual((card["state"],card["state_source"]),("waiting_user","hook"))
+                self.assertEqual(card["stage"],"等待你回复" if name == "AskUserQuestion" else "等待你确认方案")
+                self.assertFalse(card["stale"])
+                self.assertEqual(self.store.snapshot({"role":"all"},{},at+3)["counts"]["waiting"],1)
+                self.hook("PostToolUse",at+4,tool_name=name,tool_use_id="question"+str(index))
+                self.assertEqual(self.store.db.execute("SELECT state FROM sessions WHERE id=?",(sid,)).fetchone()[0],"active")
+                self.hook("Stop",at+5)
+                self.assertEqual(self.store.db.execute("SELECT state FROM sessions WHERE id=?",(sid,)).fetchone()[0],"idle")
+        self.assertNotIn(SECRET,"\n".join(self.store.db.iterdump()))
+
+    def test_claude_question_permission_without_pretool_and_later_command_approval(self):
+        self.hook("PermissionRequest",tool_name="AskUserQuestion")
+        self.assertEqual(self.store.db.execute("SELECT state FROM sessions").fetchone()[0],"waiting_user")
+        self.hook("PostToolUse",AT+1,tool_name="AskUserQuestion")
+        self.hook("PreToolUse",AT+2,tool_name="Bash",tool_use_id="command")
+        self.hook("PermissionRequest",AT+3,tool_name="Bash")
+        self.hook("Notification",AT+4,notification_type="permission_prompt")
+        self.assertEqual(self.store.db.execute("SELECT state FROM sessions").fetchone()[0],"waiting_approval")
+        self.hook("PostToolUse",AT+5,tool_use_id="command")
+        self.hook("PermissionRequest",AT+6,tool_name="AskUserQuestion",tool_use_id="command")
+        self.assertEqual(self.store.db.execute("SELECT state FROM sessions").fetchone()[0],"active")
+
+    def test_claude_untyped_question_notice_survives_restart_without_refreshing_age(self):
+        self.hook("PreToolUse",tool_name="AskUserQuestion",tool_use_id="question")
+        self.hook("PermissionRequest",AT+1,tool_name="AskUserQuestion")
+        self.assertEqual(self.store.db.execute("SELECT tool_use_id FROM claude_pending_interactions").fetchone()[0],"question")
+        self.store.db.commit()
+        self.store.close()
+        self.store = Store(self.data / "watch.sqlite")
+        self.parser = RecordParser(self.store)
+        self.hook("Notification",AT+8,notification_type="permission_prompt")
+        card = self.store.snapshot({"role":"all"},{},AT+9)["sessions"][0]
+        self.assertEqual((card["state"],card["state_at"]),("waiting_user",AT+1))
+        self.hook("Notification",AT+130,notification_type="permission_prompt")
+        card = self.store.snapshot({"role":"all"},{},AT+131)["sessions"][0]
+        self.assertEqual(card["state"],"waiting_user")
+        self.assertTrue(card["stale"])
+        self.assertEqual(card["state_at"],AT+1)
+        self.assertEqual(card["last_hook_at"],AT+130)
+
+    def test_claude_untyped_permission_without_question_identity_remains_approval(self):
+        self.hook("Notification",notification_type="agent_needs_input")
+        self.assertEqual(self.store.db.execute("SELECT state FROM sessions").fetchone()[0],"waiting_user")
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM claude_pending_interactions").fetchone()[0],0)
+        self.hook("Notification",AT+7,notification_type="permission_prompt")
+        card = self.store.snapshot({"role":"all"},{},AT+8)["sessions"][0]
+        self.assertEqual((card["state"],card["state_at"]),("waiting_approval",AT+7))
+
+    def test_claude_pending_question_is_cleared_by_new_work_and_real_permissions(self):
+        events = [("UserPromptSubmit",{}), ("PreToolUse",{"tool_name":"Bash"}),
+                  ("PermissionRequest",{"tool_name":"Bash"}), ("PermissionRequest",{}),
+                  ("PostToolUse",{"tool_use_id":"question"}), ("Stop",{}),
+                  ("SessionEnd",{}), ("PreCompact",{}),
+                  ("Notification",{"notification_type":"idle_prompt"})]
+        for index, (event, extra) in enumerate(events):
+            with self.subTest(event=event,extra=extra):
+                at = AT + index * 10
+                identity = "question" + str(index)
+                self.hook("PreToolUse",at,tool_name="AskUserQuestion",tool_use_id=identity)
+                self.hook(event,at+1,**(dict(extra,tool_use_id=identity) if "tool_use_id" in extra else extra))
+                self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM claude_pending_interactions").fetchone()[0],0)
+        self.hook("PreToolUse",AT+100,tool_name="Bash")
+        self.hook("PermissionRequest",AT+101,tool_name="Bash")
+        self.hook("Notification",AT+108,notification_type="permission_prompt")
+        self.assertEqual(self.store.db.execute("SELECT state FROM sessions").fetchone()[0],"waiting_approval")
+
+    def test_claude_pending_question_ignores_older_events_and_isolates_children(self):
+        self.hook("PreToolUse",tool_name="AskUserQuestion",tool_use_id="question")
+        self.hook("PermissionRequest",AT+2,tool_name="Bash",agent_id="child")
+        self.hook("Notification",AT+7,notification_type="permission_prompt")
+        self.assertEqual(self.store.db.execute("SELECT state FROM sessions WHERE id='claude:session2'").fetchone()[0],"waiting_user")
+        self.assertEqual(self.store.db.execute("SELECT state FROM sessions WHERE id='claude:session2:agent:child'").fetchone()[0],"waiting_approval")
+        self.hook("Stop",AT+10)
+        self.hook("PreToolUse",AT+9,tool_name="AskUserQuestion",tool_use_id="old-question")
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM claude_pending_interactions").fetchone()[0],0)
+        self.assertEqual(self.store.db.execute("SELECT state FROM sessions WHERE id='claude:session2'").fetchone()[0],"idle")
+
     def test_pid_reuse_cannot_mark_session_online(self):
         sid = self.hook("SessionStart",pid=12,process_birth="old")
         inventory = {12:{"tool":"claude","birth":"new","pid":12,"surface":"terminal","tty":"/dev/ttys001"}}

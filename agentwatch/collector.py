@@ -344,11 +344,31 @@ class RecordParser:
             "SessionEnd": ("ended", "本次运行已结束"), "PreCompact": ("active", "压缩上下文"),
             "PostCompact": ("active", "上下文压缩完成"),
         }
-        if event == "PreToolUse" and doc.get("tool_name") in ["AskUserQuestion", "ExitPlanMode"]:
-            states[event] = ("waiting_user", "等待你回复" if doc["tool_name"] == "AskUserQuestion" else "等待你确认方案")
         if event == "Notification":
             states[event] = {"permission_prompt": ("waiting_approval", "等待你批准"), "agent_needs_input": ("waiting_user", "等待你回复"), "idle_prompt": ("idle", "本轮回复已结束")}.get(doc.get("notification_type"))
+        # Claude also routes interactive tools through PermissionRequest.
+        # Their named question/plan dialog is not a command approval.
+        if (event in ["PreToolUse", "PermissionRequest"] or
+                (event == "Notification" and doc.get("notification_type") == "permission_prompt")) and doc.get("tool_name") in ["AskUserQuestion", "ExitPlanMode"]:
+            states[event] = ("waiting_user", "等待你回复" if doc["tool_name"] == "AskUserQuestion" else "等待你确认方案")
+        current = self.store.db.execute("SELECT state,state_at FROM sessions WHERE id=?", (sid,)).fetchone()
+        pending = self.store.db.execute("SELECT * FROM claude_pending_interactions WHERE session_id=?", (sid,)).fetchone()
+        if (event == "Notification" and doc.get("notification_type") == "permission_prompt" and
+                not doc.get("tool_name") and not tool_id and pending and
+                current["state"] == "waiting_user" and current["state_at"] >= pending["at"]):
+            # IDE hosts repeat question dialogs as untyped permission notices.
+            # Keep the precise type and original age, including after a restart.
+            states[event] = None
         if states.get(event) and not superseded:
+            if at >= current["state_at"]:
+                if states[event][0] == "waiting_user" and doc.get("tool_name") in ["AskUserQuestion", "ExitPlanMode"]:
+                    self.store.db.execute("""INSERT INTO claude_pending_interactions VALUES(?,?,?,?)
+                        ON CONFLICT(session_id) DO UPDATE SET tool_name=excluded.tool_name,
+                        tool_use_id=CASE WHEN excluded.tool_use_id IS NULL AND tool_name=excluded.tool_name
+                            THEN tool_use_id ELSE excluded.tool_use_id END,at=excluded.at""",
+                        (sid, doc["tool_name"], tool_id, at))
+                elif states[event][0] != "waiting_user":
+                    self.store.db.execute("DELETE FROM claude_pending_interactions WHERE session_id=?", (sid,))
             self.store.state(sid, *states[event], at, "hook", "hk:" + event_id)
         if event in ["PreCompact", "PostCompact"]:
             self.store.invalidate_context(sid, at)
