@@ -14,6 +14,8 @@ from urllib.parse import parse_qs, urlparse
 from .common import now, short_text
 from .configuration import ConfigurationError
 from .navigation import NavigationError, jump
+from .subscriptions import Subscriptions
+from .lifecycle_configuration import LifecycleConfiguration
 
 STATIC = Path(__file__).resolve().parent.parent / "web"
 
@@ -22,10 +24,13 @@ class AppServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, port, store, collector, config):
+    def __init__(self, port, store, collector, config, subscriptions=None):
         super().__init__(("127.0.0.1", port), Handler)
         self.store, self.collector, self.config = store, collector, config
         self.demo = bool(getattr(collector, "demo", False))
+        self.subscriptions = subscriptions or Subscriptions(store, demo=self.demo)
+        self.lifecycle_configs = {tool: LifecycleConfiguration(tool, home, store.path.parent)
+                                  for tool, home in [("codex", collector.codex_home), ("workbuddy", collector.workbuddy_home)]}
         self.browser_token = secrets.token_urlsafe(32)
         self.csrf_token = secrets.token_urlsafe(32)
 
@@ -117,15 +122,37 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json_response(200, snapshot)
             if path == "/api/stats":
                 return self.json_response(200, self.server.store.stats(args))
+            if path == "/api/heatmap":
+                if self.server.demo:
+                    self.server.collector.refresh()
+                heatmap = self.server.store.heatmap(args)
+                heatmap["demo"] = self.server.demo
+                return self.json_response(200, heatmap)
+            if path == "/api/children":
+                if self.server.demo:
+                    self.server.collector.refresh()
+                children = self.server.store.children(args.get("id"))
+                if children is None:
+                    return self.json_response(404, {"error": "主会话不存在或当前不可见"})
+                children["demo"] = self.server.demo
+                if self.server.demo:
+                    for card in children["children"]:
+                        card["jump"] = {"kind": "none", "label": "演示模式", "precision": None, "available": False}
+                return self.json_response(200, children)
+            if path == "/api/subscriptions":
+                return self.json_response(200, self.server.subscriptions.snapshot())
             if path == "/api/integrations":
                 configuration = self.server.config.status()
                 with self.server.store.lock:
                     hook_time = self.server.store.db.execute("SELECT MAX(last_hook_at) FROM sessions WHERE tool='claude'").fetchone()[0]
                     desktop = self.server.store.db.execute("SELECT COUNT(*) FROM sessions WHERE tool='claude' AND surface='desktop'").fetchone()[0]
+                    hook_times = {r["tool"]: r["at"] for r in self.server.store.db.execute("SELECT tool,MAX(last_hook_at) AS at FROM sessions GROUP BY tool")}
+                lifecycles = {tool: dict(config.status(), last_hook_at=hook_times.get(tool)) for tool, config in self.server.lifecycle_configs.items()}
                 return self.json_response(200, {"demo": self.server.demo, "claude": configuration, "last_hook_at": hook_time, "desktop_code_sessions": desktop,
-                    "sources": [{"tool": "codex", "name": "Codex", "present": self.server.collector.codex_home.exists(), "label": "本地会话记录与索引", "precision": "用量与上下文快照；准确等待状态视来源而定"},
+                    "lifecycles": lifecycles,
+                    "sources": [{"tool": "codex", "name": "Codex", "present": self.server.collector.codex_home.exists(), "label": "本地会话索引与官方状态 hooks", "precision": "用量、上下文与生命周期状态；hooks 需客户端审阅信任及实际上报"},
                                 {"tool": "claude", "name": "Claude Code", "present": self.server.collector.claude_home.exists(), "label": "终端、VS Code、本地桌面 Code", "precision": "记录提供用量；状态增强提供执行与等待事件"},
-                                {"tool": "workbuddy", "name": "WorkBuddy", "present": (self.server.collector.workbuddy_home / "projects").is_dir(), "label": "本地桌面会话记录（只读）", "precision": "会话、工作目录、最近活动与 token；精确等待状态、上下文占用和积分余额尚未接入"}],
+                                {"tool": "workbuddy", "name": "WorkBuddy", "present": any((self.server.collector.workbuddy_home / folder).is_dir() for folder in ["projects", "logs"]), "label": "本地会话、客户端状态日志与 hooks", "precision": "只读客户端状态事件可补充沙箱审批；hooks 提供工具与提问事件；积分需独立官方授权；上下文分母未知"}],
                     "deferred": ["Claude Cowork", "Claude Chat", "DeepSeek Harness"], "data_label": "临时演示数据（关闭后删除）" if self.server.demo else str(self.server.store.path.parent).replace(str(Path.home()), "~"),
                     "privacy": "全部为人工演示样例；未读取本机 Agent、对话或设置。" if self.server.demo else "本机运行，只保留会话元数据与统计，不保存对话正文。"})
             return self.json_response(404, {"error": "接口不存在"})
@@ -143,12 +170,25 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 return self.json_response(400, {"error": "请求格式无效"})
             path = urlparse(self.path).path
-            if self.server.demo and (path == "/api/jump" or path.startswith("/api/claude/")):
-                return self.json_response(403, {"error": "演示模式使用人工样例，不能打开真实 Agent 或修改 Claude 设置。", "demo": True})
+            if self.server.demo and (path == "/api/jump" or any(path.startswith("/api/" + tool + "/") for tool in ["claude", "codex", "workbuddy"])):
+                return self.json_response(403, {"error": "演示模式使用人工样例，不能打开真实 Agent 或修改 Agent 接入设置。", "demo": True})
             if path == "/api/rescan":
+                self.server.subscriptions.request_refresh()
                 self.server.collector.last_discovery = 0
                 self.server.collector.wake.set()
                 return self.json_response(200, {"requested": True})
+            for tool, config in self.server.lifecycle_configs.items():
+                if path in ["/api/" + tool + "/preview", "/api/" + tool + "/enable", "/api/" + tool + "/restore"]:
+                    with config.lock:
+                        if path.endswith("preview"):
+                            result = config.preview()
+                        elif path.endswith("enable"):
+                            result = config.install(body.get("hash"))
+                        else:
+                            result = config.uninstall()
+                    self.server.collector.last_discovery = 0
+                    self.server.collector.wake.set()
+                    return self.json_response(200, result)
             if path in ["/api/claude/preview", "/api/claude/enable", "/api/claude/restore"]:
                 with self.server.config.lock:
                     if path.endswith("preview"):
@@ -170,6 +210,12 @@ class Handler(BaseHTTPRequestHandler):
                             self.server.store.update(session["id"], {"alias": short_text(body.get("alias"))})
                         return self.json_response(200, {"saved": True})
                 allowed = self.server.store.jump_info(session)
+                with self.server.store.lock:
+                    visible = self.server.store.db.execute("SELECT 1 FROM visible_sessions WHERE id=?", (session["id"],)).fetchone()
+                if not visible or not allowed["available"]:
+                    return self.json_response(400, {"error": allowed.get("reason") or "此会话当前没有可靠的跳转入口。"})
+                if session["tool"] == "codex":
+                    session["_rollout_path"] = self.server.store.codex_rollout(session)
                 kind = body.get("kind", allowed["kind"])
                 # Only known, generated navigation kinds; no arbitrary path or command execution.
                 if kind != allowed["kind"] and not (kind == "codex" and session["tool"] == "codex"):

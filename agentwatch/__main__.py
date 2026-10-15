@@ -14,6 +14,7 @@ from .collector import Collector
 from .configuration import ClaudeConfiguration
 from .server import AppServer
 from .store import Store
+from .subscriptions import Subscriptions
 
 
 def main():
@@ -47,8 +48,11 @@ def main():
             collector.scan(force=True)
             print("人工演示样例检查完成；未读取本机 Agent。" if args.demo else "元数据采集完成；尚有待回补记录：" + str(collector.status["pending"]))
             return 0
+        subscriptions = Subscriptions(store, demo=args.demo,
+                                      workbuddy_token="" if args.demo else os.environ.get("AGENTWATCH_WORKBUDDY_ACCESS_TOKEN", ""))
+        cleanup.callback(subscriptions.stop)
         try:
-            server = AppServer(args.port, store, collector, config)
+            server = AppServer(args.port, store, collector, config, subscriptions=subscriptions)
         except OSError:
             print("无法监听这个本机端口。若看板已经运行，请打开 http://127.0.0.1:" + str(args.port) + "；也可以使用 --port 选择其他端口。", file=sys.stderr)
             return 1
@@ -56,6 +60,7 @@ def main():
         print("AgentWatch 已启动：" + url, flush=True)
         print("演示模式：全部为人工样例，关闭后删除临时数据。" if args.demo else "统计保存在本机；按 Control+C 停止。", flush=True)
         collector.start()
+        subscriptions.start()
         if args.open:
             threading.Timer(0.5, lambda: webbrowser.open(url)).start()
         def stop(signum, frame):

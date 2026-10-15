@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agentwatch.common import now, number, private_dir, safe_id, short_text
 from agentwatch.collector import process_inventory
+from agentwatch.subscriptions import claude_windows
 
 
 EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse",
@@ -77,6 +78,9 @@ def sanitize(doc, statusline=False, process=None, at=None):
     if process:
         row.update(pid=process["pid"], process_birth=process["birth"], tty=process["tty"], surface=process["surface"])
     if statusline:
+        windows = claude_windows(doc.get("rate_limits"))
+        if windows:
+            row["rate_limits"] = {w["key"]: {"used_percentage": w["used"], "resets_at": w["resets_at"]} for w in windows}
         context = doc.get("context_window")
         if isinstance(context, dict):
             current = context.get("current_usage")

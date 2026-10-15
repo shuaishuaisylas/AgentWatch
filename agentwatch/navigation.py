@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from pathlib import Path
 from urllib.parse import quote
 
 
@@ -13,6 +14,14 @@ class NavigationError(Exception):
 def jump(session, kind, runner=subprocess.run):
     if sys.platform != "darwin":
         raise NavigationError("这个跳转入口目前支持 macOS。")
+    if session["tool"] == "codex" and kind in ["codex", "codex_vscode"]:
+        try:
+            rollout = Path(session.get("_rollout_path") or "")
+            available = rollout.is_absolute() and rollout.is_file() and rollout.stat().st_size > 0
+        except (OSError, TypeError, ValueError):
+            available = False
+        if not available:
+            raise NavigationError("没有可恢复的本地会话记录，暂时无法定位原会话。")
     source_id = session["source_id"]
     if kind == "codex" and session["tool"] == "codex":
         command = ["open", "codex://threads/" + quote(source_id, safe="")]

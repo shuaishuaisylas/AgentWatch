@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import tempfile
 import threading
+from datetime import datetime
 from pathlib import Path
 
-from .common import now
+from .common import TZ, now
 from .store import Store
+from .subscriptions import seed_demo
 
 
 class DemoConfiguration:
@@ -44,7 +46,16 @@ class DemoCollector:
             ("codex", "error", "child", "error", "演示：构建检查失败", "online", "vscode", "构建检查", 72000, 200000, 900),
             ("workbuddy", "research", "unknown", "unknown", "最近阶段：整理演示资料", "unknown", "desktop", "市场资料整理", None, None, None),
             ("codex", "complete", "main", "idle", "演示回复已结束", "online", "desktop", "文档校对", 18000, 200000, 30),
+            ("codex", "status-only", "unknown", "active", "演示：仅收到状态上报", "unknown", "desktop", "等待会话记录", None, None, None),
+            ("codex", "implementation", "child", "active", "演示：正在实现界面", "unknown", "desktop", "组件实现", 21000, 200000, 15),
+            ("codex", "audit", "child", "waiting_approval", "演示：较久前等待批准", "unknown", "terminal", "验收操作确认", None, None, None),
+            ("codex", "copy", "child", "idle", "演示文案检查已结束", "offline", "vscode", "文案检查", 9000, 200000, 30),
+            ("codex", "offline", "child", "active", "演示：离线前的执行阶段", "offline", "terminal", "离线任务样例", None, None, None),
+            ("codex", "verification", "child", "waiting_user", "演示：等待你确认验收范围", "online", "desktop", "交互验收", None, None, None),
         ]
+        self.parents = {"codex:demo-verification": "codex:demo-implementation"}
+        self.state_ages = {"codex:demo-audit": 900}
+        self.state_sources = {"codex:demo-implementation": "event", "codex:demo-offline": "event"}
         self._seed(root)
 
     def _seed(self, root):
@@ -53,13 +64,21 @@ class DemoCollector:
             for index, sample in enumerate(self.samples):
                 tool, source, role, state, stage, online, surface, alias, used, limit, age = sample
                 sid = self.store.session(tool, "demo-" + source)
-                self.store.metadata(sid, str(root / "projects" / ("示例产品" if index < 4 else "示例研究")),
+                self.store.metadata(sid, str(root / "projects" / ("示例产品" if index < 4 or role == "child" else "示例研究")),
                                     role=role, surface=surface, alias=alias, version="演示样例")
                 if role == "child":
-                    self.store.update(sid, {"parent_id": "codex:demo-design" if tool == "codex" else "claude:demo-approval"})
-                self.store.state(sid, state, stage, current, "demo")
+                    parent = self.parents.get(sid, "codex:demo-design" if tool == "codex" else "claude:demo-approval")
+                    self.store.update(sid, {"parent_id": parent})
+                self.store.state(sid, state, stage, current - self.state_ages.get(sid, 0),
+                                 self.state_sources.get(sid, "demo"))
                 self.store.update(sid, {"liveness": online, "started_at": current - 3600,
                                         "coverage": "observed"})
+                if source == "status-only":
+                    self.store.update(sid, {"last_hook_at": current, "state_source": "hook"})
+                    continue
+                if source in {"implementation", "audit", "copy", "offline", "verification"}:
+                    # Relationship/status examples have no invented token report.
+                    continue
                 # A month of deterministic, artificial events exercises all date views.
                 for day in range(30):
                     at = current - day * 86400 - index * 60
@@ -69,16 +88,31 @@ class DemoCollector:
                                      input_count, output_count, input_count // 3,
                                      input_count // 10 if tool == "claude" else None,
                                      output_count // 4, kind="demo")
+            # Older, sparse artificial activity gives the current natural year a
+            # visible pattern without adding future usage or changing the recent month.
+            calendar = datetime.fromtimestamp(current, TZ)
+            for tool_index, sid in enumerate(["codex:demo-design", "claude:demo-approval", "workbuddy:demo-research"]):
+                for month in range(1, calendar.month + 1):
+                    for day in [2, 5, 11, 18, 23, 27]:
+                        at = datetime(calendar.year, month, day, 12, tzinfo=TZ).timestamp()
+                        if at >= current - 30 * 86400:
+                            continue
+                        input_count = 1600 + month * 240 + day * 95 + tool_index * 170
+                        output_count = 120 + (day % 5) * 45 + tool_index * 20
+                        self.store.usage(sid, f"demo-year-{tool_index}-{month}-{day}", at,
+                                         input_count, output_count, input_count // 3,
+                                         input_count // 10 if tool_index == 1 else None,
+                                         output_count // 4, kind="demo")
         self.refresh()
 
     def refresh(self):
-        """Keep the review scenario live while preserving its stale-context example."""
+        """Keep sample activity live while preserving intentionally old evidence."""
         current = now()
         with self.store.lock, self.store.db:
             for sample in self.samples:
                 tool, source, role, state, stage, online, surface, alias, used, limit, age = sample
                 sid = tool + ":demo-" + source
-                self.store.update(sid, {"last_event_at": current, "state_at": current,
+                self.store.update(sid, {"last_event_at": current, "state_at": current - self.state_ages.get(sid, 0),
                                        "context_used": used, "context_limit": limit,
                                        "context_at": current - age if age is not None else None})
                 self.store.touch(sid, current)
@@ -103,6 +137,7 @@ class DemoEnvironment:
             self.store = Store(self.root / "data" / "agentwatch.sqlite")
             self.collector = DemoCollector(self.store, self.root)
             self.config = DemoConfiguration()
+            seed_demo(self.store)
         except BaseException:
             if hasattr(self, "store"):
                 self.store.close()

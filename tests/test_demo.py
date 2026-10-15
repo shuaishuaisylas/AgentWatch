@@ -5,14 +5,17 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from agentwatch import __main__ as entrypoint
-from agentwatch.common import day_of, now
+from agentwatch.common import TZ, day_of, now
 from agentwatch.demo import DemoEnvironment
 from agentwatch.server import Handler
+from agentwatch.subscriptions import Subscriptions
+from agentwatch.lifecycle_configuration import LifecycleConfiguration
 
 
 class DemoTests(unittest.TestCase):
@@ -20,7 +23,10 @@ class DemoTests(unittest.TestCase):
         self.environment = DemoEnvironment()
         self.demo = self.environment.__enter__()
         self.server = SimpleNamespace(demo=True, store=self.demo.store,
-                                      collector=self.demo.collector, config=self.demo.config)
+                                      collector=self.demo.collector, config=self.demo.config,
+                                      lifecycle_configs={tool: LifecycleConfiguration(tool, home, self.demo.store.path.parent)
+                                                         for tool, home in [("codex", self.demo.collector.codex_home), ("workbuddy", self.demo.collector.workbuddy_home)]},
+                                      subscriptions=Subscriptions(self.demo.store, demo=True))
 
     def tearDown(self):
         self.environment.__exit__(None, None, None)
@@ -73,6 +79,10 @@ class DemoTests(unittest.TestCase):
         self.assertTrue(any(card["context_percent"] is not None and not card["context_stale"] for card in cards))
         self.assertTrue(any(card["context_stale"] for card in cards))
         self.assertTrue(all(not card["jump"]["available"] for card in cards))
+        status_only = next(card for card in cards if card["source_id"] == "demo-status-only")
+        self.assertEqual(status_only["coverage"], "status_only")
+        self.assertIsNone(status_only["usage"]["observed_total"])
+        self.assertTrue(status_only["working_directory"])
         status, stats = self.dispatch("/api/stats?role=all&period=month&date=" + day_of(now()))
         self.assertEqual(status, 200)
         self.assertGreater(stats["totals"]["total"], 0)
@@ -91,10 +101,55 @@ class DemoTests(unittest.TestCase):
         self.assertFalse(active["stale"])
         self.assertTrue(old["context_stale"])
 
+    def test_child_samples_include_nested_waiting_stale_and_offline_evidence(self):
+        status, snapshot = self.dispatch("/api/snapshot?role=all")
+        self.assertEqual(status, 200)
+        cards = {card["id"]: card for card in snapshot["sessions"]}
+        self.assertEqual(cards["codex:demo-verification"]["parent_id"], "codex:demo-implementation")
+        self.assertEqual(cards["codex:demo-implementation"]["parent_id"], "codex:demo-design")
+        self.assertEqual(cards["codex:demo-implementation"]["state"], "active")
+        self.assertEqual(cards["codex:demo-implementation"]["liveness"], "unknown")
+        self.assertEqual(cards["codex:demo-implementation"]["state_source"], "event")
+        self.assertEqual(cards["codex:demo-audit"]["state"], "waiting_approval")
+        self.assertTrue(cards["codex:demo-audit"]["stale"])
+        self.assertEqual(cards["codex:demo-copy"]["state"], "idle")
+        self.assertEqual(cards["codex:demo-copy"]["liveness"], "offline")
+        self.assertEqual(cards["codex:demo-offline"]["state"], "active")
+        self.assertEqual(cards["codex:demo-offline"]["liveness"], "offline")
+        self.assertEqual(snapshot["counts"]["active"], 3)
+        self.assertTrue(all(card["parent_id"] is None for card in cards.values() if card["role"] == "unknown"))
+        self.assertFalse(any(card["parent_id"] == "codex:demo-complete" for card in cards.values()))
+        for sid in ["codex:demo-implementation", "codex:demo-audit", "codex:demo-copy",
+                    "codex:demo-offline", "codex:demo-verification"]:
+            self.assertIsNone(cards[sid]["usage"]["observed_total"])
+        future = now() + 600
+        with patch("agentwatch.demo.now", return_value=future), patch("agentwatch.store.now", return_value=future):
+            self.demo.collector.refresh()
+            snapshot = self.demo.store.snapshot({"role": "all"}, {}, future)
+        audit = next(card for card in snapshot["sessions"] if card["id"] == "codex:demo-audit")
+        self.assertTrue(audit["stale"])
+        self.assertEqual(audit["state_age"], 900)
+
+    def test_year_samples_span_elapsed_months_without_future_or_extra_today_usage(self):
+        current = datetime(2026, 10, 15, 16, tzinfo=TZ).timestamp()
+        with patch("agentwatch.demo.now", return_value=current), patch("agentwatch.store.now", return_value=current):
+            with DemoEnvironment() as demo:
+                rows = demo.store.db.execute("SELECT at,day,kind FROM usage").fetchall()
+                self.assertEqual({row["day"][:7] for row in rows}, {f"2026-{month:02}" for month in range(1, 11)})
+                self.assertTrue(all(row["at"] <= current and row["kind"] == "demo" for row in rows))
+                today = demo.store.stats({"role": "all", "period": "day", "date": "2026-10-15"}, current)
+                # The six original usage samples retain their original current-day totals.
+                self.assertEqual(today["totals"]["total"], 9780)
+                year = demo.store.stats({"role": "all", "period": "year", "date": "2026-10-15"}, current)
+                self.assertGreater(year["totals"]["total"], today["totals"]["total"])
+                self.assertEqual(set(year["by_tool"]), {"codex", "claude", "workbuddy"})
+
     def test_real_navigation_and_claude_configuration_routes_are_forbidden(self):
         with patch("agentwatch.server.jump", side_effect=AssertionError("real navigation")), \
              patch("agentwatch.configuration.ClaudeConfiguration.install", side_effect=AssertionError("real settings")):
-            for path in ["/api/jump", "/api/claude/preview", "/api/claude/enable", "/api/claude/restore"]:
+            for path in ["/api/jump", "/api/claude/preview", "/api/claude/enable", "/api/claude/restore",
+                         "/api/codex/preview", "/api/codex/enable", "/api/codex/restore",
+                         "/api/workbuddy/preview", "/api/workbuddy/enable", "/api/workbuddy/restore"]:
                 status, payload = self.dispatch(path, {"id": "codex:demo-design", "kind": "codex"})
                 self.assertEqual(status, 403)
                 self.assertTrue(payload["demo"])
@@ -108,6 +163,13 @@ class DemoTests(unittest.TestCase):
         card = next(card for card in snapshot["sessions"] if card["id"] == "codex:demo-design")
         self.assertEqual(card["alias"], "合作者测试名称")
 
+    def test_subscription_endpoint_is_account_scoped_and_demo_only(self):
+        status, payload = self.dispatch("/api/subscriptions?tool=workbuddy&role=main&project=unrelated")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["demo"])
+        self.assertEqual({p["tool"] for p in payload["platforms"]}, {"codex", "claude", "workbuddy"})
+        self.assertTrue(all(p["limits"] for p in payload["platforms"]))
+
 
 class DemoLifecycleTests(unittest.TestCase):
     def test_context_exit_removes_database_and_source_roots(self):
@@ -119,7 +181,7 @@ class DemoLifecycleTests(unittest.TestCase):
     def test_cli_demo_ignores_real_paths_and_runs_requested_port_and_browser_mode(self):
         observed = {}
         class FakeServer:
-            def __init__(self, port, store, collector, config):
+            def __init__(self, port, store, collector, config, **options):
                 self.server_port = port
                 observed.update(port=port, root=collector.codex_home.parents[1], store=store,
                                 collector=collector, config=config)
