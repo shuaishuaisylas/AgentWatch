@@ -122,6 +122,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json_response(200, snapshot)
             if path == "/api/stats":
                 return self.json_response(200, self.server.store.stats(args))
+            if path == "/api/heatmap":
+                if self.server.demo:
+                    self.server.collector.refresh()
+                heatmap = self.server.store.heatmap(args)
+                heatmap["demo"] = self.server.demo
+                return self.json_response(200, heatmap)
+            if path == "/api/children":
+                if self.server.demo:
+                    self.server.collector.refresh()
+                children = self.server.store.children(args.get("id"))
+                if children is None:
+                    return self.json_response(404, {"error": "主会话不存在或当前不可见"})
+                children["demo"] = self.server.demo
+                if self.server.demo:
+                    for card in children["children"]:
+                        card["jump"] = {"kind": "none", "label": "演示模式", "precision": None, "available": False}
+                return self.json_response(200, children)
             if path == "/api/subscriptions":
                 return self.json_response(200, self.server.subscriptions.snapshot())
             if path == "/api/integrations":

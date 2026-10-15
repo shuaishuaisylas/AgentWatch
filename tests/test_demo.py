@@ -5,12 +5,13 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from agentwatch import __main__ as entrypoint
-from agentwatch.common import day_of, now
+from agentwatch.common import TZ, day_of, now
 from agentwatch.demo import DemoEnvironment
 from agentwatch.server import Handler
 from agentwatch.subscriptions import Subscriptions
@@ -99,6 +100,49 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(active["state"], "active")
         self.assertFalse(active["stale"])
         self.assertTrue(old["context_stale"])
+
+    def test_child_samples_include_nested_waiting_stale_and_offline_evidence(self):
+        status, snapshot = self.dispatch("/api/snapshot?role=all")
+        self.assertEqual(status, 200)
+        cards = {card["id"]: card for card in snapshot["sessions"]}
+        self.assertEqual(cards["codex:demo-verification"]["parent_id"], "codex:demo-implementation")
+        self.assertEqual(cards["codex:demo-implementation"]["parent_id"], "codex:demo-design")
+        self.assertEqual(cards["codex:demo-implementation"]["state"], "active")
+        self.assertEqual(cards["codex:demo-implementation"]["liveness"], "unknown")
+        self.assertEqual(cards["codex:demo-implementation"]["state_source"], "event")
+        self.assertEqual(cards["codex:demo-audit"]["state"], "waiting_approval")
+        self.assertTrue(cards["codex:demo-audit"]["stale"])
+        self.assertEqual(cards["codex:demo-copy"]["state"], "idle")
+        self.assertEqual(cards["codex:demo-copy"]["liveness"], "offline")
+        self.assertEqual(cards["codex:demo-offline"]["state"], "active")
+        self.assertEqual(cards["codex:demo-offline"]["liveness"], "offline")
+        self.assertEqual(snapshot["counts"]["active"], 3)
+        self.assertTrue(all(card["parent_id"] is None for card in cards.values() if card["role"] == "unknown"))
+        self.assertFalse(any(card["parent_id"] == "codex:demo-complete" for card in cards.values()))
+        for sid in ["codex:demo-implementation", "codex:demo-audit", "codex:demo-copy",
+                    "codex:demo-offline", "codex:demo-verification"]:
+            self.assertIsNone(cards[sid]["usage"]["observed_total"])
+        future = now() + 600
+        with patch("agentwatch.demo.now", return_value=future), patch("agentwatch.store.now", return_value=future):
+            self.demo.collector.refresh()
+            snapshot = self.demo.store.snapshot({"role": "all"}, {}, future)
+        audit = next(card for card in snapshot["sessions"] if card["id"] == "codex:demo-audit")
+        self.assertTrue(audit["stale"])
+        self.assertEqual(audit["state_age"], 900)
+
+    def test_year_samples_span_elapsed_months_without_future_or_extra_today_usage(self):
+        current = datetime(2026, 10, 15, 16, tzinfo=TZ).timestamp()
+        with patch("agentwatch.demo.now", return_value=current), patch("agentwatch.store.now", return_value=current):
+            with DemoEnvironment() as demo:
+                rows = demo.store.db.execute("SELECT at,day,kind FROM usage").fetchall()
+                self.assertEqual({row["day"][:7] for row in rows}, {f"2026-{month:02}" for month in range(1, 11)})
+                self.assertTrue(all(row["at"] <= current and row["kind"] == "demo" for row in rows))
+                today = demo.store.stats({"role": "all", "period": "day", "date": "2026-10-15"}, current)
+                # The six original usage samples retain their original current-day totals.
+                self.assertEqual(today["totals"]["total"], 9780)
+                year = demo.store.stats({"role": "all", "period": "year", "date": "2026-10-15"}, current)
+                self.assertGreater(year["totals"]["total"], today["totals"]["total"])
+                self.assertEqual(set(year["by_tool"]), {"codex", "claude", "workbuddy"})
 
     def test_real_navigation_and_claude_configuration_routes_are_forbidden(self):
         with patch("agentwatch.server.jump", side_effect=AssertionError("real navigation")), \

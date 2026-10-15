@@ -37,7 +37,7 @@ if (!response.ok) throw new Error(data.error || "请求失败");
 | 角色 | `main`、`child`、`unknown`；未知不能归为主会话 |
 | 执行状态 | `active`、`waiting_user`、`waiting_approval`、`idle`、`ended`、`unknown`、`error` |
 | 在线状态 | `online`、`offline`、`unknown`；进程在线不代表执行中 |
-| 演示标记 | `/api/snapshot` 和 `/api/integrations` 顶层 `demo` 为布尔值；演示 `true`，真实模式 `false` |
+| 演示标记 | `/api/snapshot`、`/api/heatmap`、`/api/children` 和 `/api/integrations` 顶层 `demo` 为布尔值；演示 `true`，真实模式 `false` |
 
 超过 120 秒没有新执行事件的 active 在快照中会保守降为 `unknown`，长工具调用也可能被降级。旧等待仍可能保留等待状态，前端必须展示 `stale` 提示。`idle` 是本轮结束后的空闲，`ended` 是运行结束，均不等于业务目标成功。
 
@@ -47,6 +47,8 @@ if (!response.ok) throw new Error(data.error || "请求失败");
 | --- | --- |
 | `GET /api/snapshot` | 当前在线或今日活动会话、计数、动态、项目与采集状态 |
 | `GET /api/stats` | 指定周期的用量、会话去重、轮次、任务与图表分桶 |
+| `GET /api/heatmap` | 北京时间当前自然年的逐日 token 热力图，仅支持工具筛选 |
+| `GET /api/children` | 指定可见主会话的全部明确子 Agent 后代及状态 |
 | `GET /api/integrations` | 数据来源发现情况、各平台状态增强配置与最近上报、演示标记 |
 | `GET /api/subscriptions` | 独立的账号订阅/积分额度快照，不受会话筛选影响 |
 
@@ -57,9 +59,9 @@ snapshot/stats 共用筛选：
 | `tool` | `all`（默认）或工具标识 | 按工具筛选 |
 | `project` | `all`（默认）或 `project_id` | 用接口返回的项目身份，不传项目名称 |
 | `surface` | `all`（默认）或入口标识 | 当前页面未提供入口筛选控件，接口支持 |
-| `role` | **`main`（API 默认）**、`child`、`unknown`、`all` | UI 初始显式传 `all`，避免隐藏关系未知来源 |
+| `role` | **`main`（API 默认）**、`child`、`unknown`、`all` | 会话卡片 UI 显式传 `main`；未知角色不能冒充主会话，API 保留其他角色查询兼容性 |
 
-stats 另支持 `period=day|week|month|year`（默认 day）、`date=YYYY-MM-DD`（默认北京时间今天）。非法日期或周期回落到服务端默认值，前端仍应传有效值。snapshot 固定为今日/在线范围，不接收历史周期；历史数据到 stats 查询。
+stats 另支持 `period=day|week|month|year`（默认 day）、`date=YYYY-MM-DD`（默认北京时间今天）。非法日期或周期回落到服务端默认值，前端仍应传有效值。snapshot 固定为今日/在线范围，不接收历史周期；`role=main`（包括省略角色）时，也保留拥有今日活动或在线明确子 Agent 后代的旧主会话入口。只沿可见、明确 child 的父链回溯，不越过 unknown 或隐藏节点。主卡片按根会话工具/项目筛选，子树不受该筛选切断。其他角色查询保留原有今日/在线范围；历史数据到 stats 查询。
 
 Codex 已归档会话及其所有后代不进入实时会话、计数或动态，即使共享进程仍在线；内部审核会话（`guardian_review` / `subagent.other=guardian`）同样隐藏，正常子 Agent 保留。归档以本地索引的明确标记为准；索引缺少此字段时可从 `archived_sessions` 目录识别。索引暂时不可用时，不撤销上次已确认的归档。常规每 20 秒重新发现，`/api/rescan` 可请求提前刷新；恢复归档后在下一次发现时重新展示。来源数据库与记录均保持只读。
 
@@ -121,7 +123,9 @@ Codex 已归档会话及其所有后代不进入实时会话、计数或动态�
 
 示例省略了若干会话元数据；`today` 的实际内容与同筛选的当日 stats 结构相同。会话标题优先使用人工 `alias`，否则显示项目名；不要从原始对话生成标题。
 
-- `counts` 基于筛选后、截断前的可见会话计算；最多返回最优先的 160 张卡片，`truncated=true` 时提示缩小范围。`unknown_roles` 是全局今日可见且关系未知的计数，不代表当前工具/项目内的数量。
+- `counts` 基于筛选后、截断前的可见会话计算；`role=main` 时仍只计算主会话自身，不把子 Agent 状态改写成主会话状态。最多返回最优先的 160 张卡片，`truncated=true` 时提示缩小范围。主卡片按自身与子摘要中最高的状态优先级排序（等待、错误、执行、未知、空闲、结束），子 Agent 的等待/错误会把根卡片提前，之后才截断。`unknown_roles` 是全局今日可见且关系未知的计数，不代表当前工具/项目内的数量。
+- 主会话卡片兼容新增 `children_summary`，结构为 `{"total":0,"active":0,"waiting":0,"error":0,"unknown":0}`，统计其全部明确、可见的子 Agent 后代，不受今日、160 张卡片或主卡片工具/项目筛选限制。包括孙辈，使用下述 children 接口的相同关系及状态规则；没有子 Agent 时各项为 0。旧后端可能缺少该字段，前端应容忍。主会话自身状态不被子 Agent 覆盖，摘要用于保留子 Agent 的待处理提示。
+- 顶层兼容新增 `children_counts`，字段与 `children_summary` 相同，聚合筛选后全部候选主会话的后代，包含未返回的第 161 张以后的主卡片。`counts` 的原有语义保持不变；仅主会话页面可以将二者的 `active` 或 `waiting` 相加，并明确标注包含子 Agent。`role=all` 等兼容查询已在 `counts` 中包含子会话，不能再次相加。旧后端缺少字段时显示旧计数，不从截断卡片推测完整子 Agent 数量。
 - `counts.active` 计入未陈旧的 active：进程 online，或来源为 hook/event 且没有明确 offline。精确事件可确认工作，但不会把 `liveness=unknown` 改成 online；在线数量和执行数量因此可以不同。
 - `projects` 是已采集项目列表，不限当前筛选；`activity` 返回当前筛选内今日最近 24 条，字段含 `id`、`at`、`kind`、`label`、`tool`、`project_name`、`session_id`。
 - `usage.today` 是北京时间当天已采集总量；`observed_total` 为看板已采集累计。`cumulative` 优先显示来源报告累计，可能高于 `observed_total`，两者不能互相替代。
@@ -150,6 +154,36 @@ Codex 已归档会话及其所有后代不进入实时会话、计数或动态�
 | `has_usage` | 所选周期是否取得用量记录 |
 
 没有用量时 `totals` 分项为 null，不能仅因空图的 bucket 值为 0 就展示“已确认零消耗”。统计不提供订阅周额度或积分余额。
+
+### `GET /api/heatmap?tool=all`
+
+固定使用请求当时 **Asia/Shanghai 的当前自然年**，从 1 月 1 日到次年 1 月 1 日（结束不含）。此接口仅接受 `tool`（默认 `all`，表示合计）；其他筛选参数、`date` 和 `period` 不改变范围。它包含各角色以及已归档、实时隐藏会话的保留用量，与 `stats?role=all&period=year` 的输入 + 输出口径一致；会话卡片只显示主会话不会减少 token 合计。旧 `/api/stats` 及其日、周、月、年行为保持兼容。
+
+| 字段 | 类型与含义 |
+| --- | --- |
+| `demo` | 布尔值，人工演示数据为 true |
+| `year`、`date` | 北京时间当年数字、今天的 `YYYY-MM-DD` |
+| `start`、`end`、`timezone` | 年初和次年年初日期、`Asia/Shanghai`；结束不含 |
+| `tool` | 实际工具筛选值，默认 `all` |
+| `tools` | 全部已发现会话的工具标识，去重排序；无用量或只有历史/子会话的工具也保留，不限当前筛选 |
+| `totals` | 与 stats 相同的 `input`、`output`、`cache_read`、`cache_write`、`reasoning`、`total`；没有已采集值时为 null，缓存及推理不重复相加 |
+| `has_usage` | 所选工具当年是否有用量记录；真实零值记录也为 true |
+| `first_usage_day` | 全库最早用量日，不限年份与工具；无记录为 null |
+| `partial_sessions` | 所选工具存在覆盖缺口的会话数，不限年份与角色 |
+| `days` | 按日期升序完整 365/366 项，每项 `{"date":"2026-10-15","tokens":1500,"has_usage":true}` |
+
+`days[].tokens` 为该日已采集 total 的合计，整数或 null。没有记录（包含未来日期）返回 `tokens=null, has_usage=false`；取得真实零值记录时返回 `tokens=0, has_usage=true`。没有记录不能描述成已确认零消耗，热力图需区分未知与已知零值。所有分桶均按北京时间。
+
+### `GET /api/children?id=codex:demo-design`
+
+`id` 必须是当前可见且 `role=main` 的主会话 ID；不存在、已隐藏、非主会话或缺少 ID 时返回 404。此接口不执行原应用跳转，也不读取对话正文。
+
+响应为 `{"demo":true,"now":1792029600,"parent_id":"codex:demo-design","children":[],"counts":{"total":0,"active":0,"waiting":0,"error":0,"unknown":0},"truncated":false}`。
+
+- `children[]` 复用 snapshot 卡片的完整安全元数据、用量、状态及 `jump` 结构，另加整数 `depth`：直系为 1、孙辈为 2，依此类推。先返回父节点再返回其后代；同级按最近活动降序，ID 作为稳定排序。演示中的所有 jump 均不可用。
+- 只沿明确 `parent_id` 且 `role=child` 的关系遍历；不把 unknown 归为主会话或子 Agent，也不越过 unknown 节点收编后代。隐藏节点及其后代不返回，沿用归档、内部审核和临时记忆隐藏规则。遍历可安全处理错误循环。
+- 包含符合上述关系的历史/离线后代，不受今日、主卡片 160 条上限、工具、项目、入口或角色筛选参数截断。当前完整返回，`truncated=false`；不能用主列表是否存在子卡片推断为空。
+- `counts` 基于完整子列表：`total` 是全部后代数；`active`、`waiting`、`error`、`unknown` 与 snapshot 使用同一状态规则。新鲜 hook/event 即使进程未知也能确认执行，明确 offline 不计执行；超过 120 秒的 active 降为 unknown，旧等待保留状态和 `stale`。这些分类不一定相加等于 total，因为空闲和结束也包含在 total 中。
 
 ### `GET /api/integrations`
 

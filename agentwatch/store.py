@@ -5,7 +5,7 @@ import os
 import sqlite3
 import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .common import TZ, day_of, fingerprint, now, period_bounds, project_identity, safe_id, short_text
 
@@ -83,6 +83,8 @@ class Store:
                 self.db.execute("ALTER TABLE sessions ADD COLUMN " + name + " " + declaration)
         self.db.executescript("""
             CREATE INDEX IF NOT EXISTS sessions_parent ON sessions(parent_id);
+            CREATE INDEX IF NOT EXISTS sessions_role_activity ON sessions(role,last_event_at);
+            CREATE INDEX IF NOT EXISTS sessions_role_liveness ON sessions(role,liveness);
             CREATE INDEX IF NOT EXISTS files_session ON files(tool,session_id);
             DROP VIEW IF EXISTS visible_sessions;
             CREATE VIEW visible_sessions AS
@@ -225,56 +227,186 @@ class Store:
                 "buckets": buckets, "first_usage_day": day_of(first) if first else None, "partial_sessions": partial,
                 "has_usage": bool(rows)}
 
+    def heatmap(self, args, current=None):
+        """Account for every role and retained history; an absent day is unknown."""
+        current = now() if current is None else current
+        year = datetime.fromtimestamp(current, TZ).year
+        start = datetime(year, 1, 1, tzinfo=TZ)
+        end = start.replace(year=year + 1)
+        tool = args.get("tool") or "all"
+        where, values = self.select_filter({"tool": tool, "role": "all"})
+        fields = ["input", "output", "cache_read", "cache_write", "reasoning", "total"]
+        with self.lock:
+            totals = dict(self.db.execute("SELECT " + ",".join("SUM(u." + key + ") AS " + key for key in fields) +
+                ",COUNT(*) AS records FROM usage u JOIN sessions s ON s.id=u.session_id WHERE " + where +
+                " AND u.at>=? AND u.at<?", (*values, start.timestamp(), end.timestamp())).fetchone())
+            daily = {r["day"]: r["tokens"] for r in self.db.execute(
+                "SELECT u.day,SUM(u.total) AS tokens FROM usage u JOIN sessions s ON s.id=u.session_id WHERE " +
+                where + " AND u.at>=? AND u.at<? GROUP BY u.day", (*values, start.timestamp(), end.timestamp()))}
+            first = self.db.execute("SELECT MIN(at) FROM usage").fetchone()[0]
+            partial = self.db.execute("SELECT COUNT(*) FROM sessions s WHERE " + where + " AND coverage!='observed'", values).fetchone()[0]
+            tools = [row[0] for row in self.db.execute("SELECT DISTINCT tool FROM sessions ORDER BY tool")]
+        has_usage = totals.pop("records") > 0
+        days = []
+        cursor = start
+        while cursor < end:
+            day = cursor.date().isoformat()
+            days.append({"date": day, "tokens": daily.get(day), "has_usage": day in daily})
+            cursor += timedelta(days=1)
+        return {"year": year, "date": day_of(current), "timezone": "Asia/Shanghai", "tool": tool,
+                "start": start.date().isoformat(), "end": end.date().isoformat(), "totals": totals,
+                "has_usage": has_usage, "first_usage_day": day_of(first) if first is not None else None,
+                "partial_sessions": partial, "tools": tools, "days": days}
+
+    @staticmethod
+    def card_state(row, current):
+        card = dict(row)
+        age = current - (card["state_at"] or 0)
+        stale = card["state"] in ["active", "waiting_user", "waiting_approval"] and age > 120
+        if stale and card["state"] == "active":
+            card["state"] = "unknown"
+            if "stage" in card:
+                card["stage"] = "最近阶段：" + card["stage"]
+        card.update(stale=stale, state_age=age)
+        return card
+
+    @staticmethod
+    def state_counts(cards):
+        return {"total": len(cards),
+                "active": sum(c["state"] == "active" and not c["stale"] and
+                              (c["liveness"] == "online" or (c["liveness"] != "offline" and c["state_source"] in ["hook", "event"])) for c in cards),
+                "waiting": sum(c["state"] in ["waiting_user", "waiting_approval"] for c in cards),
+                "error": sum(c["state"] == "error" for c in cards),
+                "unknown": sum(c["state"] == "unknown" for c in cards)}
+
+    def session_card(self, row, current):
+        """The same safe metadata and conservative state for roots and descendants."""
+        card = self.card_state(row, current)
+        card["context_stale"] = card["context_at"] is not None and current - card["context_at"] > 300
+        observed = self.db.execute("SELECT SUM(input) AS i,SUM(output) AS o,SUM(cache_read) AS cr,SUM(cache_write) AS cw,SUM(total) AS total FROM usage WHERE session_id=?", (card["id"],)).fetchone()
+        today = self.db.execute("SELECT SUM(total) FROM usage WHERE session_id=? AND day=?", (card["id"], day_of(current))).fetchone()[0]
+        card["usage"] = {"input": observed["i"], "output": observed["o"], "cache_read": observed["cr"], "cache_write": observed["cw"], "observed_total": observed["total"], "today": today,
+                         "cumulative": card["reported_total"] if card["reported_total"] is not None else observed["total"]}
+        limit, used = card["context_limit"], card["context_used"]
+        card["context_percent"] = used / limit * 100 if used is not None and limit and limit > 0 else None
+        card["jump"] = self.jump_info(card)
+        card["worktree_name"] = Path(card["worktree"]).name if card["worktree"] else None
+        directory = card["worktree"] or card["cwd"]
+        if directory:
+            directory_path = Path(directory)
+            try:
+                directory = str(Path("~") / directory_path.relative_to(Path.home()))
+            except ValueError:
+                pass
+        card["working_directory"] = directory or None
+        if card["tool"] == "codex" and card["last_hook_at"] and not self.db.execute(
+                "SELECT 1 FROM files WHERE tool='codex' AND session_id=? AND offset>0 LIMIT 1", (card["id"],)).fetchone():
+            card["coverage"] = "status_only"
+        for key in ["cwd", "worktree", "pid", "process_birth", "tty", "reported_input", "reported_output", "reported_cache_read", "reported_cache_write", "reported_total", "archived", "archive_source", "internal", "internal_memory"]:
+            card.pop(key, None)
+        return card
+
+    def descendant_rows(self, root_ids, columns="s.*"):
+        if not root_ids:
+            return []
+        # Only walk indexed, explicit child edges below visible roots. Excluding a
+        # hidden node before recursion also excludes its descendants, like the view.
+        placeholders = ",".join("?" for _ in root_ids)
+        return self.db.execute("""WITH RECURSIVE tree(root_id,id) AS (
+            SELECT s.parent_id,s.id FROM sessions s WHERE s.parent_id IN (""" + placeholders + """)
+              AND s.role='child' AND s.archived=0 AND s.internal=0 AND s.internal_memory=0
+            UNION
+            SELECT t.root_id,s.id FROM sessions s JOIN tree t ON s.parent_id=t.id
+              WHERE s.role='child' AND s.archived=0 AND s.internal=0 AND s.internal_memory=0
+            ) SELECT t.root_id,""" + columns + " FROM tree t JOIN sessions s ON s.id=t.id", root_ids).fetchall()
+
+    def children_summaries(self, root_ids, current):
+        grouped = {root_id: [] for root_id in root_ids}
+        for offset in range(0, len(root_ids), 160):
+            for row in self.descendant_rows(root_ids[offset:offset + 160], "s.state,s.state_at,s.liveness,s.state_source"):
+                grouped[row["root_id"]].append(self.card_state(row, current))
+        return {root_id: self.state_counts(cards) for root_id, cards in grouped.items()}
+
+    def children(self, parent_id, current=None):
+        current = now() if current is None else current
+        with self.lock:
+            parent = self.db.execute("SELECT 1 FROM visible_sessions WHERE id=? AND role='main'", (parent_id,)).fetchone()
+            if not parent:
+                return None
+            descendants = self.descendant_rows([parent_id])
+            by_parent = {}
+            for row in descendants:
+                by_parent.setdefault(row["parent_id"], []).append(row)
+            for siblings in by_parent.values():
+                siblings.sort(key=lambda row: (-(row["last_event_at"] or 0), row["id"]))
+            # Iterative traversal keeps arbitrarily deep trees safe, with parents
+            # before their children and a visited set for malformed cycles.
+            stack = [(row, 1) for row in reversed(by_parent.get(parent_id, []))]
+            visited, cards = {parent_id}, []
+            while stack:
+                row, depth = stack.pop()
+                if row["id"] in visited:
+                    continue
+                visited.add(row["id"])
+                card = self.session_card(row, current)
+                card.pop("root_id", None)
+                card["depth"] = depth
+                cards.append(card)
+                stack.extend((child, depth + 1) for child in reversed(by_parent.get(row["id"], [])))
+        return {"now": current, "parent_id": parent_id, "children": cards,
+                "counts": self.state_counts(cards), "truncated": False}
+
     def snapshot(self, args, scan_status, current=None):
         current = current or now()
         period, start, end, _ = period_bounds("day", day_of(current))
         where, values = self.select_filter(args)
         with self.lock:
-            rows = self.db.execute("SELECT s.* FROM visible_sessions s WHERE " + where + " AND (s.last_event_at>=? OR s.liveness='online') ORDER BY s.last_event_at DESC", (*values, start.timestamp())).fetchall()
-            cards = []
+            if args.get("role", "main") == "main":
+                # A root remains the only entry point when a child works across
+                # midnight. Seed from indexed activity, then follow explicit known
+                # parent edges upward; hidden and unknown paths stop traversal.
+                rows = self.db.execute("""WITH RECURSIVE recent_children(id,parent_id,role) AS (
+                    SELECT id,parent_id,role FROM sessions WHERE role='child' AND last_event_at>=?
+                      AND archived=0 AND internal=0 AND internal_memory=0
+                    UNION
+                    SELECT id,parent_id,role FROM sessions WHERE role='child' AND liveness='online'
+                      AND archived=0 AND internal=0 AND internal_memory=0
+                    ), ancestors(id,parent_id,role) AS (
+                    SELECT * FROM recent_children
+                    UNION
+                    SELECT p.id,p.parent_id,p.role FROM sessions p JOIN ancestors c ON p.id=c.parent_id
+                      WHERE c.role='child' AND p.role IN ('child','main')
+                        AND p.archived=0 AND p.internal=0 AND p.internal_memory=0
+                    ) SELECT s.* FROM visible_sessions s WHERE """ + where + """
+                      AND (s.last_event_at>=? OR s.liveness='online'
+                        OR s.id IN (SELECT id FROM ancestors WHERE role='main'))
+                    ORDER BY s.last_event_at DESC""", (start.timestamp(), *values, start.timestamp())).fetchall()
+            else:
+                rows = self.db.execute("SELECT s.* FROM visible_sessions s WHERE " + where + " AND (s.last_event_at>=? OR s.liveness='online') ORDER BY s.last_event_at DESC", (*values, start.timestamp())).fetchall()
             priority = {"waiting_approval": 0, "waiting_user": 0, "error": 1, "active": 2, "unknown": 3, "idle": 4, "ended": 5}
-            for r in rows:
-                card = dict(r)
-                age = current - (card["state_at"] or 0)
-                stale = card["state"] in ["active", "waiting_user", "waiting_approval"] and age > 120
-                state = "unknown" if stale and card["state"] == "active" else card["state"]
-                if state == "unknown" and stale and card["state"] == "active":
-                    card["stage"] = "最近阶段：" + card["stage"]
-                card.update(state=state, stale=stale, state_age=age, context_stale=card["context_at"] is not None and current - card["context_at"] > 300)
-                observed = self.db.execute("SELECT SUM(input) AS i,SUM(output) AS o,SUM(cache_read) AS cr,SUM(cache_write) AS cw,SUM(total) AS total FROM usage WHERE session_id=?", (card["id"],)).fetchone()
-                today = self.db.execute("SELECT SUM(total) FROM usage WHERE session_id=? AND day=?", (card["id"], day_of(current))).fetchone()[0]
-                card["usage"] = {"input": observed["i"], "output": observed["o"], "cache_read": observed["cr"], "cache_write": observed["cw"], "observed_total": observed["total"], "today": today,
-                                 "cumulative": card["reported_total"] if card["reported_total"] is not None else observed["total"]}
-                limit, used = card["context_limit"], card["context_used"]
-                card["context_percent"] = used / limit * 100 if used is not None and limit and limit > 0 else None
-                card["jump"] = self.jump_info(card)
-                card["worktree_name"] = Path(card["worktree"]).name if card["worktree"] else None
-                directory = card["worktree"] or card["cwd"]
-                if directory:
-                    directory_path = Path(directory)
-                    try:
-                        directory = str(Path("~") / directory_path.relative_to(Path.home()))
-                    except ValueError:
-                        pass
-                card["working_directory"] = directory or None
-                if card["tool"] == "codex" and card["last_hook_at"] and not self.db.execute(
-                        "SELECT 1 FROM files WHERE tool='codex' AND session_id=? AND offset>0 LIMIT 1", (card["id"],)).fetchone():
-                    card["coverage"] = "status_only"
-                for key in ["cwd", "worktree", "pid", "process_birth", "tty", "reported_input", "reported_output", "reported_cache_read", "reported_cache_write", "reported_total", "archived", "archive_source", "internal", "internal_memory"]:
-                    card.pop(key, None)
-                cards.append(card)
-            cards.sort(key=lambda c: (priority.get(c["state"], 3), -(c["last_event_at"] or 0)))
+            cards = [self.session_card(row, current) for row in rows]
+            summaries = self.children_summaries([card["id"] for card in cards if card["role"] == "main"], current)
+            children_counts = {key: sum(summary[key] for summary in summaries.values())
+                               for key in ["total", "active", "waiting", "error", "unknown"]}
+            for card in cards:
+                if card["id"] in summaries:
+                    card["children_summary"] = summaries[card["id"]]
+            def card_priority(card):
+                rank = priority.get(card["state"], 3)
+                summary = card.get("children_summary", {})
+                for key, child_rank in [("waiting", 0), ("error", 1), ("active", 2), ("unknown", 3)]:
+                    if summary.get(key):
+                        rank = min(rank, child_rank)
+                return rank, -(card["last_event_at"] or 0)
+            cards.sort(key=card_priority)
             activity = [dict(r) for r in self.db.execute("SELECT a.id,a.at,a.kind,a.label,s.tool,s.source_id,s.project_name,s.id AS session_id FROM activity a JOIN visible_sessions s ON s.id=a.session_id WHERE " + where + " AND a.at>=? AND a.at<? ORDER BY a.at DESC LIMIT 24", (*values, start.timestamp(), end.timestamp()))]
             projects = [dict(r) for r in self.db.execute("SELECT s.project_id AS id,s.project_name AS name,COUNT(*) AS sessions FROM sessions s WHERE s.internal_memory=0 OR EXISTS (SELECT 1 FROM usage u WHERE u.session_id=s.id) GROUP BY s.project_id,s.project_name ORDER BY s.project_name")]
             unknown_roles = self.db.execute("SELECT COUNT(*) FROM visible_sessions WHERE role='unknown' AND last_event_at>=?", (start.timestamp(),)).fetchone()[0]
-        counts = {"observed": len(cards), "online": sum(c["liveness"] == "online" for c in cards),
-                  "active": sum(c["state"] == "active" and not c["stale"] and
-                                (c["liveness"] == "online" or (c["liveness"] != "offline" and c["state_source"] in ["hook", "event"]))
-                                for c in cards),
-                  "waiting": sum(c["state"] in ["waiting_user", "waiting_approval"] for c in cards),
-                  "error": sum(c["state"] == "error" for c in cards),
-                  "unknown": sum(c["state"] == "unknown" for c in cards), "unknown_roles": unknown_roles}
-        return {"now": current, "date": day_of(current), "timezone": "Asia/Shanghai", "counts": counts, "sessions": cards[:160],
+        counts = self.state_counts(cards)
+        counts["observed"] = counts.pop("total")
+        counts.update(online=sum(c["liveness"] == "online" for c in cards), unknown_roles=unknown_roles)
+        return {"now": current, "date": day_of(current), "timezone": "Asia/Shanghai", "counts": counts,
+                "children_counts": children_counts, "sessions": cards[:160],
                 "truncated": len(cards) > 160, "activity": activity, "projects": projects, "scan": scan_status,
                 "today": self.stats(dict(args, period="day", date=day_of(current)), current)}
 

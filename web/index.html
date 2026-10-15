@@ -33,7 +33,7 @@
       <div class="page-content">
         <div class="notice" id="demo-banner" role="status" hidden>演示模式 · 全部为人工样例，不读取本机 Agent 数据；应用跳转和配置修改已停用。</div>
         <div class="page-heading"><div><div class="eyebrow" id="eyebrow">YOUR AGENTS, AT A GLANCE</div><h1 id="page-title">每个会话，都在视线里。</h1><p id="page-description">先看谁需要你，再看状态与用量。</p></div><button class="button secondary" id="refresh"><span>↻</span> 刷新数据</button></div>
-        <div class="filterbar" id="filterbar"><div class="filter-field"><label for="tool-filter">工具</label><select id="tool-filter"><option value="all">全部工具</option></select></div><div class="filter-field"><label for="project-filter">项目</label><select id="project-filter"><option value="all">全部项目</option></select></div><div class="filter-field"><label for="role-filter">会话范围</label><select id="role-filter"><option value="all">全部会话</option><option value="main">主会话</option><option value="child">子 Agent</option><option value="unknown">关系未知</option></select></div><div class="snapshot-time" id="snapshot-time">等待首次采集</div></div>
+        <div class="filterbar" id="filterbar"><div class="filter-field"><label for="tool-filter">工具</label><select id="tool-filter"><option value="all">合计</option></select></div><span class="filter-scope" id="filter-scope">主会话 · 点击查看子 Agent</span><div class="snapshot-time" id="snapshot-time">等待首次采集</div></div>
 
         <section id="view-live" class="view">
           <div class="metrics" id="live-metrics"><div class="loading-block">正在读取本机会话…</div></div>
@@ -42,17 +42,24 @@
             <div class="subscription-grid" id="subscription-cards"><div class="empty-small">正在读取额度快照…</div></div>
           </section>
           <div id="coverage-banner" class="notice" hidden></div>
-          <div class="section-heading"><div><h2>当前会话 <span id="session-count">—</span></h2><p>当前在线与今日有活动的会话</p></div><div class="state-tabs" aria-label="状态筛选"><button class="selected" data-state="all">全部</button><button data-state="waiting">需要处理 <span id="waiting-tab-count">0</span></button><button data-state="active">执行中</button><button data-state="unknown">待确认</button></div></div>
+          <div class="section-heading"><div><h2>主会话 <span id="session-count">—</span></h2><p>当前在线与今日有活动的主会话 · 点击查看子 Agent</p></div><div class="state-tabs" aria-label="状态筛选"><button class="selected" data-state="all">全部</button><button data-state="waiting">需要处理 <span id="waiting-tab-count">0</span></button><button data-state="active">执行中</button><button data-state="unknown">待确认</button></div></div>
           <div class="session-grid" id="sessions"><div class="empty-state"><div class="empty-symbol">⌁</div><h3>正在发现你的 Agent</h3><p>保留原来的启动方式，看板会读取可观测的本机会话。</p></div></div>
           <section class="activity-panel"><div class="section-heading compact"><div><h2>今日动态</h2><p>只展示状态变化，不展示对话内容</p></div><span id="activity-date" class="muted">—</span></div><div id="activity"><div class="empty-small">等待状态事件</div></div></section>
         </section>
 
         <section id="view-history" class="view" hidden>
-          <div class="history-controls"><div class="period-tabs" aria-label="统计周期"><button data-period="day" class="selected">日</button><button data-period="week">周</button><button data-period="month">月</button><button data-period="year">年</button></div><div class="date-control"><button id="date-prev" aria-label="上一个周期">‹</button><input type="date" id="stats-date" aria-label="统计日期"><button id="date-next" aria-label="下一个周期">›</button></div><span id="period-range" class="muted">—</span></div>
-          <div class="metrics history-metrics" id="history-metrics"></div>
-          <div class="chart-panel"><div class="section-heading compact"><div><h2>Token 使用趋势</h2><p>按事件所属时间统计，缓存分项不重复相加</p></div><span id="chart-total" class="chart-total">—</span></div><div id="chart" class="chart"></div><div id="chart-labels" class="chart-labels"></div><div class="chart-legend"><span class="legend-dot"></span> 已采集 token <span id="history-coverage" class="muted"></span></div></div>
-          <div class="history-bottom"><div class="breakdown-panel"><h2>用量组成</h2><p class="muted">输入含已报告的缓存分项；输出含已报告的推理分项。</p><div id="breakdown"></div></div><div class="breakdown-panel"><h2>按工具统计</h2><p class="muted">当前筛选范围，使用相同的日期窗口。</p><div id="by-tool"></div></div></div>
-          <div class="footnote">会话数在所选周期内去重。活动轮次与任务分别统计；任务只计入有可靠身份的来源。缺失的用量显示“—”，不会补零。</div>
+          <div class="history-year-heading"><div><span class="year-tag" id="heatmap-year">本年度</span><span class="muted" id="period-range">北京时间 · 自然年</span></div><span class="muted">含主会话与子 Agent 的已采集用量</span></div>
+          <div class="metrics history-metrics" id="history-metrics"><div class="loading-block">正在读取年度用量…</div></div>
+          <section class="heatmap-panel" aria-labelledby="heatmap-title">
+            <div class="section-heading compact"><div><h2 id="heatmap-title">每一天的 Token</h2><p>一格一天，颜色随已采集用量加深</p></div><div class="heatmap-total"><strong id="chart-total">—</strong><span>本年已采集 token</span></div></div>
+            <div id="history-status" class="heatmap-status" role="status">正在读取本年度记录…</div>
+            <div class="heatmap-scroll" id="heatmap-scroll" tabindex="0" role="region" aria-label="年度每日 Token 热力图，可横向滚动">
+              <div id="heatmap" class="heatmap"><div class="empty-small">正在准备日历…</div></div>
+            </div>
+            <div class="heatmap-footer"><span id="heatmap-selection">悬停或点选日期查看用量，方向键可浏览日期。</span><div class="heatmap-legend" aria-label="用量颜色图例"><span>少</span><i class="heatmap-level-0"></i><i class="heatmap-level-1"></i><i class="heatmap-level-2"></i><i class="heatmap-level-3"></i><i class="heatmap-level-4"></i><span>多</span><span class="legend-divider"></span><i class="heatmap-missing"></i><span>未记录</span><i class="heatmap-future"></i><span>未来</span></div></div>
+          </section>
+          <div class="annual-breakdown"><span>用量分项</span><div id="breakdown"></div></div>
+          <div class="footnote">总量为输入 + 输出；缓存与推理是其中分项，不重复累加。未取得记录的日期显示“未记录”，不代表零消耗。</div>
         </section>
 
         <section id="view-settings" class="view" hidden>
@@ -65,7 +72,8 @@
       </div>
     </main>
   </div>
+  <div id="heatmap-tooltip" class="heatmap-tooltip" role="tooltip" hidden></div>
   <div id="toast" class="toast" role="status" hidden></div>
-  <dialog id="modal"><div class="modal-heading"><h2 id="modal-title"></h2><button class="icon-button" id="modal-close" aria-label="关闭">×</button></div><div id="modal-body"></div><div id="modal-actions" class="modal-actions"></div></dialog>
+  <dialog id="modal" aria-labelledby="modal-title"><div class="modal-heading"><h2 id="modal-title"></h2><button class="icon-button" id="modal-close" aria-label="关闭">×</button></div><div id="modal-body"></div><div id="modal-actions" class="modal-actions"></div></dialog>
 </body>
 </html>
