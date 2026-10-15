@@ -53,7 +53,7 @@ function showView(view) {
   }[view];
   ["breadcrumb","eyebrow","page-title","page-description"].forEach((id,i) => $(`#${id}`).textContent = headings[i]);
   if (view === "history") loadHistory().catch(error => toast(error.message));
-  if (view === "settings") loadSettings().catch(error => toast(error.message));
+  if (view === "settings") return loadSettings().catch(error => toast(error.message));
 }
 
 function renderSnapshot(data) {
@@ -108,11 +108,33 @@ function renderCards() {
   </article>`).join("") : `<div class="empty-state"><div class="empty-symbol">⌁</div><h3>${state.status === "all" ? "这个范围内还没有可见会话" : "当前没有符合此状态的会话"}</h3><p>${$("#role-filter").value === "main" ? "未报告主子关系的会话可在“关系未知”或“全部会话”中查看。" : "照常使用已接入的工具，或切换工具、项目和会话范围。"}</p></div>`;
   document.querySelectorAll("[data-width]").forEach(el => el.style.width = `${el.dataset.width}%`);
 }
+function renderSubscriptions(data) {
+  const statusNames = {available:"已获取",stale:"旧快照",unavailable:"未获取",auth_required:"需授权",error:"更新失败"};
+  $("#subscription-cards").innerHTML = data.platforms.map(platform => {
+    const windows = platform.limits.map(limit => {
+      const expired = limit.status === "expired";
+      const stale = limit.status === "stale";
+      const value = limit.remaining == null ? "—" : limit.unit === "percent" ? `${fmt(limit.remaining)}%` : `${fmt(limit.remaining)} 积分`;
+      const reset = limit.resets_at ? `重置 ${dateTime(limit.resets_at)}` : "重置时间未报告";
+      const detail = limit.unit === "credits" ? `已用 ${fmt(limit.used)} / 合计 ${fmt(limit.limit)}` : `${expired || stale ? "上次已用" : "已用"} ${fmt(limit.used)}%`;
+      const caption = expired ? "已到重置时间，等待新快照" : stale ? "上次报告的剩余量" : "剩余";
+      return `<div class="quota-window"><div class="quota-window-title"><span>${esc(limit.label)}</span>${limit.bucket !== platform.tool ? `<small>${esc(limit.bucket)}</small>` : ""}</div><div class="quota-value ${expired || stale ? "old" : (limit.remaining_percent != null && limit.remaining_percent <= 10 ? "low" : "")}"><strong>${esc(value)}</strong><span>${esc(caption)}</span></div><div class="quota-track"><i data-quota-width="${expired || limit.remaining_percent == null ? 0 : Math.max(0,Math.min(100,limit.remaining_percent))}"></i></div><div class="quota-detail">${esc(detail)} · ${esc(reset)}</div></div>`;
+    }).join("");
+    const action = platform.tool === "claude" && !platform.limits.length ? '<button class="quota-setup" data-quota-setup="claude">设置状态栏上报 ↗</button>' : "";
+    return `<article class="quota-card"><div class="quota-heading">${toolIcon(platform.tool)}<h3>${esc(platform.name)}</h3><span class="quota-status ${esc(platform.status)}">${esc(data.demo ? "人工样例" : statusNames[platform.status] || "未获取")}</span></div>${windows || '<div class="quota-empty"><strong>—</strong><span>尚未取得订阅剩余量</span></div>'}<p class="quota-notice">${esc(platform.notice)}</p>${action}<div class="quota-updated">${platform.updated_at ? `来源更新 ${dateTime(platform.updated_at)}` : "等待来源数据"}${platform.refreshing ? " · 正在更新" : ""}</div></article>`;
+  }).join("");
+  document.querySelectorAll("[data-quota-width]").forEach(el => el.style.width = `${el.dataset.quotaWidth}%`);
+}
+
 async function refresh() {
   if (state.busy) return;
   state.busy = true;
   try {
-    renderSnapshot(await api(`/api/snapshot?${query()}`));
+    const [snapshot, subscriptions] = await Promise.allSettled([api(`/api/snapshot?${query()}`),api("/api/subscriptions")]);
+    if (snapshot.status === "rejected") throw snapshot.reason;
+    renderSnapshot(snapshot.value);
+    if (subscriptions.status === "fulfilled") renderSubscriptions(subscriptions.value);
+    else $("#subscription-cards").innerHTML = '<div class="empty-small">额度读取未完成，请更新后重试。会话数据仍可查看。</div>';
   } catch (error) {
     $("#connection-text").textContent = "采集服务未连接";
     $("#connection-dot").classList.add("offline");
@@ -147,7 +169,7 @@ async function loadSettings() {
   $("#enable-claude").disabled = Boolean(data.demo);
   $("#restore-claude").disabled = Boolean(data.demo);
   $("#include-statusline").disabled = Boolean(data.demo);
-  $("#source-panels").innerHTML = data.sources.map(source => `<div class="source-panel"><div class="source-heading">${toolIcon(source.tool,true)}<h3>${esc(source.name)}</h3><span class="status-chip ${source.present ? "idle" : "unknown"}">${source.present ? "发现本地目录" : "尚未发现"}</span></div><p>${esc(source.label)}</p><div class="source-precision">${esc(source.precision)}</div>${source.tool === "workbuddy" ? '<div class="source-precision">只读本机会话和数字用量。积分余额与精准等待状态尚未接入；不修改 WorkBuddy 设置。</div>' : ""}</div>`).join("");
+  $("#source-panels").innerHTML = data.sources.map(source => `<div class="source-panel"><div class="source-heading">${toolIcon(source.tool,true)}<h3>${esc(source.name)}</h3><span class="status-chip ${source.present ? "idle" : "unknown"}">${source.present ? "发现本地目录" : "尚未发现"}</span></div><p>${esc(source.label)}</p><div class="source-precision">${esc(source.precision)}</div>${source.tool === "workbuddy" ? '<div class="source-precision">本地读取会话与 token；积分余额通过官方授权接口单独查询，不修改 WorkBuddy 设置。</div>' : ""}</div>`).join("");
   const config = data.claude;
   $("#enhance-status").textContent = config.error || (config.complete ? data.last_hook_at ? "已配置 · 已收到上报" : "已配置 · 等待实际状态上报" : config.enabled ? "部分事件已配置" : "可选增强 · 尚未启用");
   $("#enhance-status").className = `status-chip ${config.complete ? "idle" : "unknown"}`;
@@ -229,6 +251,16 @@ $("#refresh").onclick = async () => {
   catch (error) { toast(error.message); }
 };
 $("#stats-date").value = today();
+$("#refresh-subscriptions").onclick = async () => {
+  try { await api("/api/rescan",{}); await refresh(); toast("已请求更新额度；新数据到达后会自动显示。"); }
+  catch (error) { toast(error.message); }
+};
+$("#subscription-cards").onclick = async event => {
+  if (event.target.closest("[data-quota-setup]")) {
+    await showView("settings");
+    $("#include-statusline").checked = true;
+  }
+};
 $("#stats-date").onchange = () => loadHistory().catch(error => toast(error.message));
 function shiftDate(direction) {
   const d = new Date(`${$("#stats-date").value || today()}T12:00:00`);

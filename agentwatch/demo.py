@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .common import now
 from .store import Store
+from .subscriptions import seed_demo
 
 
 class DemoConfiguration:
@@ -103,6 +104,7 @@ class DemoEnvironment:
             self.store = Store(self.root / "data" / "agentwatch.sqlite")
             self.collector = DemoCollector(self.store, self.root)
             self.config = DemoConfiguration()
+            seed_demo(self.store)
         except BaseException:
             if hasattr(self, "store"):
                 self.store.close()

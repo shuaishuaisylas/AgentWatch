@@ -62,6 +62,10 @@ class Store:
               session_id TEXT, kind TEXT, source_id TEXT, at REAL, PRIMARY KEY(session_id,kind,source_id)
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS subscription_snapshots (
+              tool TEXT NOT NULL, bucket TEXT NOT NULL, source TEXT NOT NULL, at REAL NOT NULL, data TEXT NOT NULL,
+              PRIMARY KEY(tool,bucket)
+            );
         """)
         os.chmod(self.path, 0o600)
         self.db.commit()

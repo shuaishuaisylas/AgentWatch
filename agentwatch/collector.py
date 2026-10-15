@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from .common import fingerprint, now, number, safe_id, short_text, timestamp
+from .subscriptions import backfill_codex, record_claude, record_codex
 
 
 def surface_for(originator="", executable="", tty=None):
@@ -118,6 +119,7 @@ class RecordParser:
         event = payload.get("type")
         if event == "token_count":
             self.codex_usage(sid, payload.get("info"), at, cursor)
+            record_codex(self.store, payload.get("rate_limits"), at)
         elif event in ["task_started", "task_complete", "turn_aborted"]:
             turn = safe_id(payload.get("turn_id"))
             if turn:
@@ -312,6 +314,7 @@ class RecordParser:
         if event == "SessionEnd":
             self.store.update(sid, {"liveness": "offline"})
         if event == "Statusline":
+            record_claude(self.store, doc.get("rate_limits"), at)
             used, limit = number(doc.get("context_used")), number(doc.get("context_limit"))
             if doc.get("context_valid") is False:
                 self.store.invalidate_context(sid, at)
@@ -407,6 +410,7 @@ class Collector:
         self.thread = None
         self.discovered = {}
         self.last_discovery = self.last_probe = 0
+        self.quota_bootstrapped = False
         self.status = {"running": False, "files": 0, "pending": 0, "read_bytes": 0, "last_scan": None, "errors": 0}
         self.allowed_roots = [self.codex_home.resolve(), self.claude_home.resolve(), self.desktop_home.resolve(), self.data_dir.resolve()]
 
@@ -524,6 +528,10 @@ class Collector:
             except (ValueError, OSError, UnicodeError):
                 self.status["errors"] += 1
         self.discovered = files
+        if not self.quota_bootstrapped:
+            with self.store.lock, self.store.db:
+                backfill_codex(self.store, files)
+            self.quota_bootstrapped = True
         self.status["files"] = len(files)
         self.last_discovery = now()
 

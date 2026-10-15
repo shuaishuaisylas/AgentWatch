@@ -91,7 +91,7 @@ class ClaudeConfiguration:
         return {"hash": fingerprint(raw.decode("utf-8")), "events": EVENTS, "add_events": len(EVENTS) - status["installed_events"],
                 "include_statusline": bool(include_statusline), "has_statusline": bool(config.get("statusLine")),
                 "command": self.hook_command, "settings_label": "Claude 用户设置 settings.json",
-                "effect": "后台上报状态，保留现有 hooks；不会批准、拒绝或执行 Agent 的任务。新启动的本机会话可开始上报。",
+                "effect": "后台上报状态，保留现有 hooks；不会批准、拒绝或执行 Agent 的任务。新启动的本机会话可开始上报。" + ("状态栏同时上报上下文和来源提供的订阅额度。" if include_statusline else ""),
                 "privacy": "只写会话标识、状态、时间和数字统计，丢弃提示词、回复与工具参数。"}
 
     def install(self, expected_hash, include_statusline=False):

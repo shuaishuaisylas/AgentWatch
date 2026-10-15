@@ -55,7 +55,33 @@ python3 -m agentwatch --open
 
 当前可展示已采集的输入、输出和缓存 token，并纳入日、周、月、年统计。记录未报告可靠主子关系时，显示“关系未知”。没有可靠运行事件时保留“待确认”；请求 token 不作为上下文占用，缺少有效快照时显示不可用。
 
-积分余额、订阅剩余与精准等待状态尚未接入。跳转仅打开 WorkBuddy 应用，不能保证定位原会话。这里读取的是本地记录，尚未接入需要额外授权的 WorkBuddy 开放平台。
+本地会话与 token 不需要云端授权。积分余额通过独立的官方授权接口读取，配置方式见下文；精准等待状态仍未接入。跳转仅打开 WorkBuddy 应用，不能保证定位原会话。
+
+## 订阅与积分剩余
+
+首页新增账号额度卡片，独立于工具、项目、角色筛选和会话 token 统计。百分比保留来源精度；缺失数据不补零。快照超过 15 分钟显示“旧快照”，到达重置时间后剩余量显示“—”，直到来源重新报告。
+
+| 平台 | 读取方式 | 条件与边界 |
+| --- | --- | --- |
+| Codex | 本地 `token_count.rate_limits` 快照 | 按实际 `window_minutes` 区分周额度、5 小时等窗口；不把 primary 固定当作 5 小时。不额外启动 Agent 或调用模型 API |
+| Claude Code | 官方 statusLine 的 `rate_limits` | 在接入设置勾选“同时上报终端上下文和订阅额度”，预览并启用，然后由新的 Pro/Max 会话完成一次回复；5 小时与每周窗口可分别缺失 |
+| WorkBuddy | 官方 `GET /openapi/v2/credit` | 需要具有 `user.credit.readable` 的官方 OAuth access token；返回资源包总额和已用积分，无法拆分订阅、充值、赠送，也不返回周重置时间 |
+
+WorkBuddy 读取运行环境中的 `AGENTWATCH_WORKBUDDY_ACCESS_TOKEN`。凭证由官方第三方应用授权流程获取，不复用或提取桌面软件的私有凭据。当前未实现应用注册/OAuth 登录界面或自动续期。未配置、授权失败或响应字段缺失时明确显示未知；不从本地累计 token 推算积分。
+
+已具备正式授权凭证时，可在 macOS zsh 终端隐藏输入后启动（令牌不进入命令参数）：
+
+```sh
+read -s 'AGENTWATCH_WORKBUDDY_ACCESS_TOKEN?WorkBuddy access token: '
+export AGENTWATCH_WORKBUDDY_ACCESS_TOKEN
+python3 -m agentwatch --open
+```
+
+积分服务每 5 分钟后台查询一次；“更新额度”可请求更新，最短间隔 30 秒。凭证和 WorkBuddy 余额仅保留在本次进程内存，不写入数据库或页面。演示模式完全忽略凭证、不发网络请求，展示三家的人工额度样例。
+
+Codex、Claude 的数字代表最近本机会话报告的账号额度；多账号切换或未启动客户端时可能不是当前登录账号的实时值，需结合来源时间和原客户端确认。当前账号的 Claude 状态栏上报与 WorkBuddy 正式授权仍需真实客户端验收。
+
+依据：[Codex 官方额度字段](https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt)、[Claude 状态栏字段](https://code.claude.com/docs/en/statusline)、[WorkBuddy 积分接口](https://open.workbuddy.cn/en/docs/openapi)。
 
 ## 数字与状态的边界
 

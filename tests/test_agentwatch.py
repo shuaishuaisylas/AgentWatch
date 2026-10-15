@@ -535,6 +535,10 @@ class HttpTests(Fixture):
         csrf = re.search(b'name="csrf" content="([^"]+)"',html)[1].decode()
         cookie = headers["Set-Cookie"].split(";")[0]
         self.assertEqual(self.request("/api/snapshot")[0],401)
+        self.assertEqual(self.request("/api/subscriptions")[0],401)
+        quota_status,_,quota_body = self.request("/api/subscriptions",Cookie=cookie)
+        self.assertEqual(quota_status,200)
+        self.assertEqual(len(json.loads(quota_body)["platforms"]),3)
         self.assertEqual(self.request("/api/snapshot",Cookie=cookie)[0],200)
         self.assertEqual(self.request("/api/rescan","POST",{},Cookie=cookie)[0],403)
         self.assertEqual(self.request("/api/rescan","POST",{},Cookie=cookie,**{"X-AgentWatch-CSRF":csrf})[0],200)

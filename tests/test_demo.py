@@ -13,6 +13,7 @@ from agentwatch import __main__ as entrypoint
 from agentwatch.common import day_of, now
 from agentwatch.demo import DemoEnvironment
 from agentwatch.server import Handler
+from agentwatch.subscriptions import Subscriptions
 
 
 class DemoTests(unittest.TestCase):
@@ -20,7 +21,8 @@ class DemoTests(unittest.TestCase):
         self.environment = DemoEnvironment()
         self.demo = self.environment.__enter__()
         self.server = SimpleNamespace(demo=True, store=self.demo.store,
-                                      collector=self.demo.collector, config=self.demo.config)
+                                      collector=self.demo.collector, config=self.demo.config,
+                                      subscriptions=Subscriptions(self.demo.store, demo=True))
 
     def tearDown(self):
         self.environment.__exit__(None, None, None)
@@ -108,6 +110,13 @@ class DemoTests(unittest.TestCase):
         card = next(card for card in snapshot["sessions"] if card["id"] == "codex:demo-design")
         self.assertEqual(card["alias"], "合作者测试名称")
 
+    def test_subscription_endpoint_is_account_scoped_and_demo_only(self):
+        status, payload = self.dispatch("/api/subscriptions?tool=workbuddy&role=main&project=unrelated")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["demo"])
+        self.assertEqual({p["tool"] for p in payload["platforms"]}, {"codex", "claude", "workbuddy"})
+        self.assertTrue(all(p["limits"] for p in payload["platforms"]))
+
 
 class DemoLifecycleTests(unittest.TestCase):
     def test_context_exit_removes_database_and_source_roots(self):
@@ -119,7 +128,7 @@ class DemoLifecycleTests(unittest.TestCase):
     def test_cli_demo_ignores_real_paths_and_runs_requested_port_and_browser_mode(self):
         observed = {}
         class FakeServer:
-            def __init__(self, port, store, collector, config):
+            def __init__(self, port, store, collector, config, **options):
                 self.server_port = port
                 observed.update(port=port, root=collector.codex_home.parents[1], store=store,
                                 collector=collector, config=config)

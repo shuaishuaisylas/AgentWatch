@@ -48,6 +48,7 @@ if (!response.ok) throw new Error(data.error || "请求失败");
 | `GET /api/snapshot` | 当前在线或今日活动会话、计数、动态、项目与采集状态 |
 | `GET /api/stats` | 指定周期的用量、会话去重、轮次、任务与图表分桶 |
 | `GET /api/integrations` | 数据来源发现情况、Claude 增强状态与演示标记 |
+| `GET /api/subscriptions` | 独立的账号订阅/积分额度快照，不受会话筛选影响 |
 
 snapshot/stats 共用筛选：
 
@@ -145,6 +146,38 @@ stats 另支持 `period=day|week|month|year`（默认 day）、`date=YYYY-MM-DD`
 - `claude`：`enabled`、`installed_events`、`complete`、`statusline_enabled`、`backup`、`error`；配置读取失败时可能没有 complete。配置完成不等于收到真实上报。
 - `last_hook_at`：最近上报 epoch 秒或 null；`desktop_code_sessions`：已发现的桌面 Code 会话数。
 - `deferred`、`data_label`、`privacy`：尚未接入来源、数据位置展示文字和隐私说明；前端把位置当文本，不据此访问文件。
+
+## 订阅与积分额度
+
+### `GET /api/subscriptions`
+
+响应为 `{"demo":false,"now":1792029600,"platforms":[...]}`。接口需要同源首页 cookie，没有查询参数；工具、项目、角色筛选不改变账号额度。每个 `platforms[]` 包含：
+
+| 字段 | 类型与含义 |
+| --- | --- |
+| `tool`、`name` | 平台标识与名称；当前三家均返回，即使没有数据 |
+| `status` | `available` 已取得至少一个有效窗口、`stale` 仅有旧或过期窗口、`unavailable` 未报告、`auth_required` WorkBuddy 需要凭证/授权、`error` 查询失败 |
+| `updated_at` | 来源上次报告的 epoch 秒或 null；GET 请求时间不能当作来源更新时间 |
+| `notice` | 口径和接入条件，按文本展示，不解析成页面代码 |
+| `refreshing` | WorkBuddy 后台是否正在查询；其余为 false |
+| `limits[]` | 实际取得的窗口列表；空列表表示未知，不能补造 100% |
+
+每个窗口含 `key`、`bucket`、`label`、`source`、`observed_at`，以及：
+
+| 字段 | 类型与含义 |
+| --- | --- |
+| `unit` | `percent`（Codex/Claude）或 `credits`（WorkBuddy） |
+| `limit`、`used`、`remaining` | 数值；百分比 limit=100；积分按官方资源包总额计算，剩余不小于 0 |
+| `remaining_percent` | 百分比数值或 null；积分总额为 0 时为 null，禁止除零 |
+| `window_minutes` | 来源实际窗口长度或 null；10080 为周、300 为 5 小时；不能硬编码 Codex primary=5小时 |
+| `resets_at` | 下一次重置 epoch 秒或 null；WorkBuddy 总包积分不提供此字段 |
+| `status` | `available`、`stale`（超过 900 秒或来源时间异常）、`expired`（已到重置时间） |
+
+`expired` 窗口的 remaining 与 remaining_percent 为 null，等待新报告；不得自行恢复为 100%。`stale` 保留最后值，但必须标成旧快照，不承诺实时。WorkBuddy 更新失败时，可保留内存中的最后值并标为旧值；平台级错误提示不能被窗口旧值覆盖。不同 bucket 不能相加，Codex 模型专项额度须保留 bucket 标识。
+
+Codex 来源为 `codex_record`，Claude 为 `claude_statusline`，WorkBuddy 正式数据为 `workbuddy_openapi`。它们是最近本机会话/正式凭证对应的账号快照，无法保证切换账号后仍代表当前账号。演示顶层 demo=true，所有数据为人工样例，凭证被忽略且不联网。
+
+“更新额度”调用已有 `POST /api/rescan`，仅表示已请求采集/后台查询；WorkBuddy 最短间隔 30 秒，常规每 300 秒查询，页面持续读取缓存。缺少 WorkBuddy 凭证不发请求，也不复用之前进程的积分缓存。凭证配置和官方链接见 README。
 
 ## 写入与操作接口
 

@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 from .common import now, short_text
 from .configuration import ConfigurationError
 from .navigation import NavigationError, jump
+from .subscriptions import Subscriptions
 
 STATIC = Path(__file__).resolve().parent.parent / "web"
 
@@ -22,10 +23,11 @@ class AppServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, port, store, collector, config):
+    def __init__(self, port, store, collector, config, subscriptions=None):
         super().__init__(("127.0.0.1", port), Handler)
         self.store, self.collector, self.config = store, collector, config
         self.demo = bool(getattr(collector, "demo", False))
+        self.subscriptions = subscriptions or Subscriptions(store, demo=self.demo)
         self.browser_token = secrets.token_urlsafe(32)
         self.csrf_token = secrets.token_urlsafe(32)
 
@@ -117,6 +119,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json_response(200, snapshot)
             if path == "/api/stats":
                 return self.json_response(200, self.server.store.stats(args))
+            if path == "/api/subscriptions":
+                return self.json_response(200, self.server.subscriptions.snapshot())
             if path == "/api/integrations":
                 configuration = self.server.config.status()
                 with self.server.store.lock:
@@ -125,7 +129,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json_response(200, {"demo": self.server.demo, "claude": configuration, "last_hook_at": hook_time, "desktop_code_sessions": desktop,
                     "sources": [{"tool": "codex", "name": "Codex", "present": self.server.collector.codex_home.exists(), "label": "本地会话记录与索引", "precision": "用量与上下文快照；准确等待状态视来源而定"},
                                 {"tool": "claude", "name": "Claude Code", "present": self.server.collector.claude_home.exists(), "label": "终端、VS Code、本地桌面 Code", "precision": "记录提供用量；状态增强提供执行与等待事件"},
-                                {"tool": "workbuddy", "name": "WorkBuddy", "present": (self.server.collector.workbuddy_home / "projects").is_dir(), "label": "本地桌面会话记录（只读）", "precision": "会话、工作目录、最近活动与 token；精确等待状态、上下文占用和积分余额尚未接入"}],
+                                {"tool": "workbuddy", "name": "WorkBuddy", "present": (self.server.collector.workbuddy_home / "projects").is_dir(), "label": "本地桌面会话记录（只读）", "precision": "会话、工作目录、最近活动与 token；积分需独立官方授权；精确等待状态和上下文占用尚未接入"}],
                     "deferred": ["Claude Cowork", "Claude Chat", "DeepSeek Harness"], "data_label": "临时演示数据（关闭后删除）" if self.server.demo else str(self.server.store.path.parent).replace(str(Path.home()), "~"),
                     "privacy": "全部为人工演示样例；未读取本机 Agent、对话或设置。" if self.server.demo else "本机运行，只保留会话元数据与统计，不保存对话正文。"})
             return self.json_response(404, {"error": "接口不存在"})
@@ -146,6 +150,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.server.demo and (path == "/api/jump" or path.startswith("/api/claude/")):
                 return self.json_response(403, {"error": "演示模式使用人工样例，不能打开真实 Agent 或修改 Claude 设置。", "demo": True})
             if path == "/api/rescan":
+                self.server.subscriptions.request_refresh()
                 self.server.collector.last_discovery = 0
                 self.server.collector.wake.set()
                 return self.json_response(200, {"requested": True})

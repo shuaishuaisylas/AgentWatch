@@ -37,6 +37,10 @@
 
         <section id="view-live" class="view">
           <div class="metrics" id="live-metrics"><div class="loading-block">正在读取本机会话…</div></div>
+          <section class="subscription-panel" aria-label="订阅与积分剩余">
+            <div class="section-heading compact"><div><h2>订阅与积分剩余</h2><p>账号额度 · 独立于下方会话用量和筛选范围</p></div><button class="button secondary" id="refresh-subscriptions">更新额度</button></div>
+            <div class="subscription-grid" id="subscription-cards"><div class="empty-small">正在读取额度快照…</div></div>
+          </section>
           <div id="coverage-banner" class="notice" hidden></div>
           <div class="section-heading"><div><h2>当前会话 <span id="session-count">—</span></h2><p>当前在线与今日有活动的会话</p></div><div class="state-tabs" aria-label="状态筛选"><button class="selected" data-state="all">全部</button><button data-state="waiting">需要处理 <span id="waiting-tab-count">0</span></button><button data-state="active">执行中</button><button data-state="unknown">待确认</button></div></div>
           <div class="session-grid" id="sessions"><div class="empty-state"><div class="empty-symbol">⌁</div><h3>正在发现你的 Agent</h3><p>保留原来的启动方式，看板会读取可观测的本机会话。</p></div></div>
@@ -54,8 +58,8 @@
         <section id="view-settings" class="view" hidden>
           <div class="settings-intro"><span class="privacy-badge">◇ LOCAL FIRST</span><h2>按你原来的方式使用 Agent。</h2><p>看板从本机记录发现会话。首次启用增强后，Claude 会主动告诉看板：它在处理需求，还是在等你。</p></div>
           <div id="source-panels" class="source-panels"></div>
-          <div class="enhance-panel"><div class="enhance-heading"><span class="tool-icon claude large">✳</span><div><h2>Claude Code 准确状态</h2><p>区分正在执行、等待批准、等待回复与本轮结束。</p></div><span id="enhance-status" class="status-chip unknown">读取设置中</span></div><div class="enhance-content"><p>新增后台状态上报，保留现有设置。启用前可查看新增内容；系统会备份，之后可以撤销。</p><label class="checkbox-row"><input type="checkbox" id="include-statusline"><span>同时上报终端上下文占用<small>保留已有状态栏的输出；没有状态栏时添加一条简短显示。</small></span></label><div class="enhance-actions"><button class="button primary" id="enable-claude">预览并启用</button><button class="button secondary" id="restore-claude" hidden>撤销 AgentWatch 设置</button><span id="hook-last-seen" class="muted"></span></div><div class="settings-note">已启动的会话不一定会重新读取设置。启用后，新启动的本机 Claude Code 会话开始上报；终端、VS Code 和桌面 Code 以各自实际生效情况为准。</div></div></div>
-          <div class="settings-bottom"><div><h3>只保留必要信息</h3><p>会话身份、项目、状态与数字用量。不会保存提示词、回复、代码、工具参数或凭据。</p><div class="data-location" id="data-location"></div></div><div><h3>采集边界</h3><p>本版本接入 Codex、Claude Code 与 WorkBuddy 本地记录。WorkBuddy 积分余额与精准等待状态尚未接入；豆包工作、Claude Cowork 和普通 Chat 尚未接入。</p></div></div>
+          <div class="enhance-panel"><div class="enhance-heading"><span class="tool-icon claude large">✳</span><div><h2>Claude Code 准确状态</h2><p>区分正在执行、等待批准、等待回复与本轮结束。</p></div><span id="enhance-status" class="status-chip unknown">读取设置中</span></div><div class="enhance-content"><p>新增后台状态上报，保留现有设置。启用前可查看新增内容；系统会备份，之后可以撤销。</p><label class="checkbox-row"><input type="checkbox" id="include-statusline"><span>同时上报终端上下文和订阅额度<small>保留已有状态栏输出；订阅额度需来源在回复后实际报告。</small></span></label><div class="enhance-actions"><button class="button primary" id="enable-claude">预览并启用</button><button class="button secondary" id="restore-claude" hidden>撤销 AgentWatch 设置</button><span id="hook-last-seen" class="muted"></span></div><div class="settings-note">已启动的会话不一定会重新读取设置。启用后，新启动的本机 Claude Code 会话开始上报；终端、VS Code 和桌面 Code 以各自实际生效情况为准。</div></div></div>
+          <div class="settings-bottom"><div><h3>只保留必要信息</h3><p>会话身份、项目、状态、数字用量与额度快照。不会保存提示词、回复、代码、工具参数或凭据。</p><div class="data-location" id="data-location"></div></div><div><h3>采集边界</h3><p>订阅与积分需要来源实际报告，缺失时不估算。WorkBuddy 积分查询需要官方授权；精准等待、豆包工作、Claude Cowork 和普通 Chat 尚未接入。</p></div></div>
         </section>
         <footer><span>所有数字仅代表看板可观测范围</span><span>AgentWatch <span class="footer-dot">·</span> 本机 Agent 看板</span></footer>
       </div>

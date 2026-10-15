@@ -26,6 +26,7 @@ python3 -m agentwatch --demo --port 8767 --open
 - `role=unknown` 不能归为主会话。API 未传角色时默认主会话；界面初始显式传 `role=all`。
 - 缺少上下文分母不计算百分比；WorkBuddy 请求 token 不能当成上下文占用。
 - 缓存、推理通常是输入、输出的分项，不重复加到总量。活动轮次与原生任务不是同一指标。
+- 订阅额度由 `/api/subscriptions` 独立提供，不能用会话 token 推算。保留窗口口径、更新时间、旧快照和重置后未知状态；WorkBuddy 积分不是周订阅额度。
 - 跳转按钮根据 `jump.available`、`label` 和 `precision` 展示，不能承诺所有来源都能定位原会话。
 - 工具、状态和来源按接口数据渲染；保留未知工具的名称回退，不把统计限定为两家。
 

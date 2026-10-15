@@ -73,6 +73,8 @@ python3 -m agentwatch --demo --port 8767 --open
 
 ## 已知边界
 
-Claude 真实 hooks 尚未完成所有客户端入口的端到端验收；WorkBuddy 精准等待状态、上下文占用和积分/订阅剩余尚未接入；豆包工作、Claude Cowork 和普通 Chat 尚未接入；桌面顶部灵动岛仍未实现。应用跳转按来源精度执行，打开应用不等于已定位原会话。
+Claude 真实 hooks 尚未完成所有客户端入口的端到端验收；WorkBuddy 精准等待状态与上下文占用尚未接入；豆包工作、Claude Cowork 和普通 Chat 尚未接入；桌面顶部灵动岛仍未实现。应用跳转按来源精度执行，打开应用不等于已定位原会话。
+
+订阅卡片由独立 `GET /api/subscriptions` 提供，不受会话筛选影响。Codex 读取本地额度快照；Claude 需要状态栏实际报告；WorkBuddy 积分 API 已实现，但需要正式 OAuth 访问凭证，当前账号尚未验证。前端不得把“接口实现”显示为“当前账号已授权”，也不得把旧快照或已过重置时间的值标为实时剩余。详见 API 文档与 README 的配置说明。
 
 许可证尚未指定。未经项目维护者确定，不添加 MIT 等许可证。
