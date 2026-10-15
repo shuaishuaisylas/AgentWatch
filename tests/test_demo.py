@@ -14,6 +14,7 @@ from agentwatch.common import day_of, now
 from agentwatch.demo import DemoEnvironment
 from agentwatch.server import Handler
 from agentwatch.subscriptions import Subscriptions
+from agentwatch.lifecycle_configuration import LifecycleConfiguration
 
 
 class DemoTests(unittest.TestCase):
@@ -22,6 +23,8 @@ class DemoTests(unittest.TestCase):
         self.demo = self.environment.__enter__()
         self.server = SimpleNamespace(demo=True, store=self.demo.store,
                                       collector=self.demo.collector, config=self.demo.config,
+                                      lifecycle_configs={tool: LifecycleConfiguration(tool, home, self.demo.store.path.parent)
+                                                         for tool, home in [("codex", self.demo.collector.codex_home), ("workbuddy", self.demo.collector.workbuddy_home)]},
                                       subscriptions=Subscriptions(self.demo.store, demo=True))
 
     def tearDown(self):
@@ -96,7 +99,9 @@ class DemoTests(unittest.TestCase):
     def test_real_navigation_and_claude_configuration_routes_are_forbidden(self):
         with patch("agentwatch.server.jump", side_effect=AssertionError("real navigation")), \
              patch("agentwatch.configuration.ClaudeConfiguration.install", side_effect=AssertionError("real settings")):
-            for path in ["/api/jump", "/api/claude/preview", "/api/claude/enable", "/api/claude/restore"]:
+            for path in ["/api/jump", "/api/claude/preview", "/api/claude/enable", "/api/claude/restore",
+                         "/api/codex/preview", "/api/codex/enable", "/api/codex/restore",
+                         "/api/workbuddy/preview", "/api/workbuddy/enable", "/api/workbuddy/restore"]:
                 status, payload = self.dispatch(path, {"id": "codex:demo-design", "kind": "codex"})
                 self.assertEqual(status, 403)
                 self.assertTrue(payload["demo"])

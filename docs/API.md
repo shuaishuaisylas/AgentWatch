@@ -39,7 +39,7 @@ if (!response.ok) throw new Error(data.error || "请求失败");
 | 在线状态 | `online`、`offline`、`unknown`；进程在线不代表执行中 |
 | 演示标记 | `/api/snapshot` 和 `/api/integrations` 顶层 `demo` 为布尔值；演示 `true`，真实模式 `false` |
 
-陈旧 active 在快照中会保守降为 `unknown`。旧等待仍可能保留等待状态，前端必须展示 `stale` 提示。`idle` 是本轮结束，`ended` 是运行结束，均不等于业务目标成功。
+超过 120 秒没有新执行事件的 active 在快照中会保守降为 `unknown`，长工具调用也可能被降级。旧等待仍可能保留等待状态，前端必须展示 `stale` 提示。`idle` 是本轮结束后的空闲，`ended` 是运行结束，均不等于业务目标成功。
 
 ## 读取接口和筛选
 
@@ -47,7 +47,7 @@ if (!response.ok) throw new Error(data.error || "请求失败");
 | --- | --- |
 | `GET /api/snapshot` | 当前在线或今日活动会话、计数、动态、项目与采集状态 |
 | `GET /api/stats` | 指定周期的用量、会话去重、轮次、任务与图表分桶 |
-| `GET /api/integrations` | 数据来源发现情况、Claude 增强状态与演示标记 |
+| `GET /api/integrations` | 数据来源发现情况、各平台状态增强配置与最近上报、演示标记 |
 | `GET /api/subscriptions` | 独立的账号订阅/积分额度快照，不受会话筛选影响 |
 
 snapshot/stats 共用筛选：
@@ -117,10 +117,12 @@ Codex 已归档会话及其所有后代不进入实时会话、计数或动态�
 示例省略了若干会话元数据；`today` 的实际内容与同筛选的当日 stats 结构相同。会话标题优先使用人工 `alias`，否则显示项目名；不要从原始对话生成标题。
 
 - `counts` 基于筛选后、截断前的可见会话计算；最多返回最优先的 160 张卡片，`truncated=true` 时提示缩小范围。`unknown_roles` 是全局今日可见且关系未知的计数，不代表当前工具/项目内的数量。
+- `counts.active` 计入未陈旧的 active：进程 online，或来源为 hook/event 且没有明确 offline。精确事件可确认工作，但不会把 `liveness=unknown` 改成 online；在线数量和执行数量因此可以不同。
 - `projects` 是已采集项目列表，不限当前筛选；`activity` 返回当前筛选内今日最近 24 条，字段含 `id`、`at`、`kind`、`label`、`tool`、`project_name`、`session_id`。
 - `usage.today` 是北京时间当天已采集总量；`observed_total` 为看板已采集累计。`cumulative` 优先显示来源报告累计，可能高于 `observed_total`，两者不能互相替代。
 - 仅当 `context_percent` 有效时绘制百分比；`context_used` 有值但分母未知时只展示 token 数。WorkBuddy 不提供上下文快照。
-- `state_source` 包括本地记录 `record`、明确事件 `event`、Claude 上报 `hook`、进程观测 `process`；演示可能为 `demo`，不能把它当真实来源。
+- `state_source` 包括本地记录 `record`、明确事件 `event`、Codex / Claude / WorkBuddy 上报 `hook`、进程观测 `process`；演示可能为 `demo`，不能把它当真实来源。来源已使用 hooks 后，原始记录不覆盖其状态。
+- WorkBuddy 桌面沙箱批准通过 SDK 状态机日志补充，来源为 `event`。只接受明确的转换信号，`PERMISSION_REQUESTED` 对应待批准，`PERMISSION_RESOLVED` 对应继续执行，`TURN_COMPLETED` 对应本轮空闲；不能把工具返回或 `PHASE_IDLE` 当成整轮结束。提问工具的 hook 可细分为等待回复。已收到明确 hook/event 后，普通记录不能降级覆盖它；桌面会话有原生状态来源时，CLI 工作进程退出不会将整条会话改成运行结束。
 - `coverage` 当前可能为 `observed`、`partial_baseline`、`counter_reset`、`partial_usage`、`partial_records`、`missing_time`、`missing_request_id`；新增值应有通用显示回退。
 - `jump` 使用服务端给出的按钮文字、可用性和精度；真实模式可能为 `codex`、`codex_vscode`、`terminal`、`project`、`claude`、`workbuddy` 或 `none`。打开应用与定位会话是不同精度。
 
@@ -148,7 +150,8 @@ Codex 已归档会话及其所有后代不进入实时会话、计数或动态�
 - `demo`：用于演示标识和禁用真实操作。
 - `sources[]`：`tool`、`name`、`present`、`label`、`precision`；`present` 表示发现来源目录，不代表准确状态已验收。
 - `claude`：`enabled`、`installed_events`、`complete`、`statusline_enabled`、`backup`、`error`；配置读取失败时可能没有 complete。配置完成不等于收到真实上报。
-- `last_hook_at`：最近上报 epoch 秒或 null；`desktop_code_sessions`：已发现的桌面 Code 会话数。
+- `last_hook_at`：Claude 最近上报 epoch 秒或 null；`desktop_code_sessions`：已发现的桌面 Code 会话数。
+- `lifecycles`：以 `codex`、`workbuddy` 为键。每项含 `enabled`（布尔）、`installed_events`（整数）、`complete`（布尔）、`review_required`（布尔）、`error`（文本或 null）、`last_hook_at`（epoch 秒或 null）。`review_required=true` 表示该平台要求客户端审阅信任，不是读取了当前信任状态；目前 Codex 为 true。`complete` 仅表示所需配置齐全，不能推断已信任、每种事件已触发或所有入口都支持。
 - `deferred`、`data_label`、`privacy`：尚未接入来源、数据位置展示文字和隐私说明；前端把位置当文本，不据此访问文件。
 
 ## 订阅与积分额度
@@ -195,12 +198,17 @@ Codex 来源为 `codex_record`，Claude 为 `claude_statusline`，WorkBuddy 正�
 | `/api/claude/preview` | `{"statusline":false}` | 返回新增配置预览，无配置写入 | 403 禁止 |
 | `/api/claude/enable` | `{"hash":"预览返回的hash","statusline":false}` | 备份后合并 Claude 配置 | 403 禁止 |
 | `/api/claude/restore` | `{}` | 移除看板添加的配置，保留其他修改 | 403 禁止 |
+| `/api/codex/preview`、`/api/workbuddy/preview` | `{}` | 返回新增状态配置预览，不写入配置 | 403 禁止 |
+| `/api/codex/enable`、`/api/workbuddy/enable` | `{"hash":"预览返回的hash"}` | 备份后合并状态 hooks，不修改客户端信任与批准策略 | 403 禁止 |
+| `/api/codex/restore`、`/api/workbuddy/restore` | `{}` | 仅移除 AgentWatch 状态 hooks，保留其他设置 | 403 禁止 |
 
 jump 的 `kind` 通常省略，使用服务端默认；Codex 会话详情允许显式请求 `kind="codex"` 作为桌面备用入口。其他任意路径、命令或 URL 不被接受。
 
 Claude preview 返回 `hash`、`events`、`add_events`、`include_statusline`、`has_statusline`、`command`、`settings_label`、`effect`、`privacy`。前端先展示预览，由用户操作后再 enable；`hash` 来自本次预览，`statusline` 与预览选择一致。服务端检测设置变化会返回 409，重新预览后处理。真实模式中的配置操作不属于纯前端开发验收。
 
 enable 成功返回当前 Claude 配置状态，字段与 integrations 中的 `claude` 一致；restore 返回 `removed`（移除 hook 数）、`enabled` 和 `message`。配置保存成功仍需真实客户端事件验证。
+
+Codex / WorkBuddy preview 返回 `hash`、`tool`、`events`（事件名数组）、`command`、`settings_label`、`effect`、`privacy`、`next_step`。enable 使用本次预览的 hash，返回对应 lifecycles 配置状态（不含 last_hook_at）；restore 返回 `removed`、`enabled`。预览后配置变化返回 409，需重新预览。状态传输仅包含允许的身份、时间、事件和进程元数据；启用后新开或继续真实客户端会话，检查上报时间，不能用保存成功代替验收。
 
 ## 错误和联调检查
 
@@ -212,7 +220,7 @@ enable 成功返回当前 Claude 配置状态，字段与 integrations 中的 `c
 | 401 | 缺少/过期 cookie；访问同源首页重新初始化 |
 | 403 | Host/Origin/CSRF 校验失败，或演示模式禁止真实操作 |
 | 404 | 接口或会话不存在 |
-| 409 | Claude 配置在预览后改变，或不能安全合并 |
+| 409 | Agent 配置在预览后改变，或不能安全合并 |
 | 500 | 读取或操作未完成；页面保留已有数据并明确未更新 |
 
 接口变更时同步本文、前端调用、人工演示数据和相关测试；记录字段类型、可空性、单位与兼容处理。不要用关掉校验、补零、猜状态或复制真实会话来解决联调问题。

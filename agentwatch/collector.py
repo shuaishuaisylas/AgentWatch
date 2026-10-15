@@ -13,6 +13,27 @@ from pathlib import Path
 
 from .common import fingerprint, now, number, safe_id, short_text, timestamp
 from .subscriptions import backfill_codex, record_claude, record_codex
+from .lifecycle_bridge import EVENTS as LIFECYCLE_EVENTS
+
+
+def workbuddy_transition(raw, source_id):
+    """Read only the SDK's typed state transitions, never diagnostic bodies."""
+    try:
+        stamp, marker, payload = raw.decode("utf-8").split(" ", 2)
+        if marker != "state-machine:transition":
+            return None
+        doc = json.loads(payload)
+        at = timestamp(stamp)
+        if not isinstance(doc, dict) or at is None or not safe_id(source_id) or doc.get("conversationId") != source_id:
+            return None
+        signal, target = doc.get("input"), doc.get("to")
+        signals = {"PROMPT_SENT", "PHASE_WORKING", "PHASE_PLANNING", "PERMISSION_REQUESTED",
+                   "PERMISSION_RESOLVED", "TURN_COMPLETED", "TURN_CANCELLED", "TURN_FAILED"}
+        if not isinstance(signal, str) or signal not in signals or target not in ["working", "planning", "pending", "idle", "error", "failed", "terminated", "archived"]:
+            return None
+        return {"session_id": source_id, "at": at, "signal": signal, "target": target}
+    except (ValueError, UnicodeError):
+        return None
 
 
 def codex_source(value):
@@ -64,6 +85,8 @@ def process_inventory():
         if base in ["claude", "claude-code"] or "/claude/versions/" in executable.lower():
             if "/contents/macos/claude" not in executable.lower():
                 tool = "claude"
+        if base == "workbuddy" and "/workbuddy.app/" in executable.lower():
+            tool = "workbuddy"
         tty = "/dev/" + fields[7] if re.fullmatch(r"ttys\d+", fields[7]) else None
         result[pid] = {"pid": pid, "ppid": ppid, "birth": " ".join(fields[2:7]), "tty": tty,
                        "executable": executable, "tool": tool, "surface": surface_for(executable=executable, tty=tty)}
@@ -348,6 +371,101 @@ class RecordParser:
         self.store.touch(sid, at)
         return sid
 
+    def lifecycle(self, doc, cursor):
+        if not isinstance(doc, dict) or doc.get("agentwatch") != 1:
+            return None
+        tool, event = doc.get("tool"), doc.get("event")
+        if tool not in LIFECYCLE_EVENTS or event not in LIFECYCLE_EVENTS[tool]:
+            return None
+        identity, event_id, at = safe_id(doc.get("session_id")), safe_id(doc.get("id")), timestamp(doc.get("at"))
+        if not identity or not event_id or at is None:
+            return None
+        event_id = "lifecycle:" + tool + ":" + event_id
+        if self.store.db.execute("SELECT 1 FROM hook_seen WHERE id=?", (event_id,)).fetchone():
+            return None
+        self.store.db.execute("INSERT INTO hook_seen VALUES(?)", (event_id,))
+        parent = self.store.session(tool, identity)
+        child = safe_id(doc.get("agent_id")) if event in ["SubagentStart", "SubagentStop"] else None
+        if event in ["SubagentStart", "SubagentStop"] and not child:
+            return parent
+        sid = self.store.session(tool, child) if child else parent
+        row = self.store.db.execute("SELECT state,state_source,state_at,last_hook_at,liveness FROM sessions WHERE id=?", (sid,)).fetchone()
+        values = {"last_hook_at": max(at, row["last_hook_at"] or 0)}
+        if child:
+            values.update(role="child", parent_id=parent)
+        if doc.get("surface") in ["desktop", "vscode", "terminal"]:
+            values["surface"] = doc["surface"]
+        if tool == "workbuddy":
+            values["surface"] = "desktop"
+        if at >= row["state_at"] and isinstance(doc.get("pid"), int) and not isinstance(doc["pid"], bool) and doc["pid"] > 1 and isinstance(doc.get("process_birth"), str):
+            values.update(pid=doc["pid"], process_birth=doc["process_birth"], tty=doc.get("tty"), liveness="online")
+        self.store.metadata(sid, doc.get("cwd"), **values)
+        turn = safe_id(doc.get("turn_id")) if not child else None
+        tool_id = safe_id(doc.get("tool_use_id"))
+        if turn and event in ["Stop", "Interrupt", "StopFailure"]:
+            self.store.db.execute("INSERT OR IGNORE INTO hook_closed VALUES(?,?,?,?)", (sid, "turn", turn, at))
+        if tool_id and event in ["PostToolUse", "PostToolUseFailure"]:
+            self.store.db.execute("INSERT OR IGNORE INTO hook_closed VALUES(?,?,?,?)", (sid, "tool", tool_id, at))
+        superseded = False
+        if event in ["UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "PostToolUseFailure", "PreCompact", "PostCompact"]:
+            superseded = bool(turn and self.store.db.execute("SELECT 1 FROM hook_closed WHERE session_id=? AND kind='turn' AND source_id=?", (sid, turn)).fetchone())
+        if event in ["PreToolUse", "PermissionRequest"] and tool_id:
+            superseded |= self.store.db.execute("SELECT 1 FROM hook_closed WHERE session_id=? AND kind='tool' AND source_id=?", (sid, tool_id)).fetchone() is not None
+        states = {"SessionStart": ("unknown", "已接入 · 等待状态事件"),
+                  "UserPromptSubmit": ("active", "正在处理你的需求"), "PreToolUse": ("active", "调用工具"),
+                  "PostToolUse": ("active", "工具返回 · 继续处理"), "PermissionRequest": ("waiting_approval", "等待你批准"),
+                  "Stop": ("idle", "本轮回复已结束"), "Interrupt": ("idle", "本轮已中断"),
+                  "SessionEnd": ("ended", "本次运行已结束"), "StopFailure": ("error", "本轮出现错误"),
+                  "PostToolUseFailure": ("active", "工具失败 · Agent 可继续处理"),
+                  "PreCompact": ("active", "压缩上下文"), "PostCompact": ("active", "上下文压缩完成"),
+                  "SubagentStart": ("active", "子 Agent 正在工作"), "SubagentStop": ("idle", "子 Agent 本轮已结束")}
+        name = (doc.get("tool_name") or "").rsplit(".", 1)[-1]
+        if event in ["PreToolUse", "PermissionRequest"] and (name in ["AskUserQuestion", "ExitPlanMode", "request_user_input", "request_user_input_async"] or name.endswith("__request_user_input")):
+            states[event] = ("waiting_user", "等待你确认方案" if name == "ExitPlanMode" else "等待你回复")
+        if event == "SessionStart" and doc.get("source") == "compact":
+            states[event] = ("active", "上下文压缩完成 · 继续处理")
+        elif event == "SessionStart" and row["state_source"] in ["hook", "event"] and row["state"] in ["active", "waiting_user", "waiting_approval"] and at - row["state_at"] < 120:
+            states[event] = None  # A late worker-start event does not undo a submitted prompt.
+        native_conversation = tool == "workbuddy" and self.store.db.execute(
+            "SELECT 1 FROM files WHERE tool='workbuddy_state' AND session_id=? LIMIT 1", (sid,)).fetchone()
+        if native_conversation and event == "SessionEnd":
+            states[event] = None  # The desktop conversation can outlive its CLI worker.
+        if event == "Notification":
+            states[event] = {"permission_prompt": ("waiting_approval", "等待你批准"),
+                             "agent_needs_input": ("waiting_user", "等待你回复"),
+                             "elicitation_dialog": ("waiting_user", "等待你填写信息"),
+                             "idle_prompt": ("idle", "本轮回复已结束")}.get(doc.get("notification_type"))
+        if states.get(event) and not superseded:
+            if event != "SessionEnd" and at >= row["state_at"] and row["liveness"] == "offline" and "liveness" not in values:
+                # Desktop clients can reuse a conversation after its worker exits.
+                # Fresh lifecycle evidence clears old offline data without inventing a PID.
+                self.store.update(sid, {"liveness": "unknown"})
+            self.store.state(sid, *states[event], at, "hook", event_id)
+        if event == "SessionEnd" and states.get(event) and at >= row["state_at"]:
+            self.store.update(sid, {"liveness": "offline"})
+        self.store.touch(sid, at)
+        return sid
+
+    def workbuddy_state(self, doc):
+        sid = self.store.session("workbuddy", doc["session_id"])
+        at, signal, target = doc["at"], doc["signal"], doc["target"]
+        state = None
+        if signal == "PERMISSION_REQUESTED" and target == "pending":
+            state = ("waiting_approval", "等待你批准 · WorkBuddy 客户端")
+        elif signal in ["PROMPT_SENT", "PHASE_WORKING", "PHASE_PLANNING", "PERMISSION_RESOLVED"] and target in ["working", "planning"]:
+            state = ("active", "正在处理 · WorkBuddy 客户端")
+        elif signal in ["TURN_COMPLETED", "TURN_CANCELLED"] and target == "idle":
+            state = ("idle", "本轮回复已结束")
+        elif signal == "TURN_FAILED" and target in ["error", "failed"]:
+            state = ("error", "本轮出现错误")
+        if state:
+            row = self.store.db.execute("SELECT state_at,liveness FROM sessions WHERE id=?", (sid,)).fetchone()
+            self.store.metadata(sid, surface="desktop")
+            if at >= row["state_at"] and row["liveness"] == "offline":
+                self.store.update(sid, {"liveness": "unknown"})
+            self.store.state(sid, *state, at, "event", fingerprint("workbuddy-state:" + sid + str(at) + signal))
+        return sid
+
     def workbuddy(self, doc, cursor, fallback_sid=None):
         """Read numeric request usage and metadata only, never generated titles/content."""
         if not isinstance(doc, dict):
@@ -441,6 +559,25 @@ class Collector:
         except (ValueError, OSError, RuntimeError):
             return False
 
+    def permitted_workbuddy_state(self, path):
+        try:
+            root = self.workbuddy_home.resolve()
+            logs = (self.workbuddy_home / "logs").resolve()
+            relative = Path(path).resolve().relative_to(logs)
+            return (logs.is_relative_to(root) and len(relative.parts) == 4 and
+                    re.fullmatch(r"\d{4}-\d{2}-\d{2}", relative.parts[0]) is not None and
+                    relative.parts[1:3] == ("sdk", "conversations") and Path(path).suffix == ".log" and
+                    bool(safe_id(Path(path).stem)))
+        except (ValueError, OSError, RuntimeError):
+            return False
+
+    def workbuddy_state_files(self):
+        logs = self.workbuddy_home / "logs"
+        if logs.is_dir():
+            for path in logs.glob("*/sdk/conversations/*.log"):
+                if path.is_file() and self.permitted_workbuddy_state(path):
+                    yield str(path.resolve()), "workbuddy:" + path.stem
+
     def permitted(self, path):
         try:
             resolved = Path(path).resolve()
@@ -527,9 +664,14 @@ class Collector:
             for path in projects.rglob("*.jsonl"):
                 if path.is_file() and self.permitted_workbuddy(path):
                     files.setdefault(str(path.resolve()), ("workbuddy", None))
+        for path, sid in self.workbuddy_state_files():
+            files[path] = ("workbuddy_state", sid)
         events = self.data_dir / "claude-events.jsonl"
-        if events.exists():
-            files[str(events.resolve())] = ("hook", None)
+        # Track the private transports before their first event, so first-time
+        # setup does not wait for the next source-discovery interval.
+        files[str(events.resolve())] = ("hook", None)
+        lifecycle = self.data_dir / "lifecycle-events.jsonl"
+        files[str(lifecycle.resolve())] = ("lifecycle", None)
         # Desktop Code can identify its exact transcript through a configured hook.
         registry = self.data_dir / "transcripts.jsonl"
         if registry.exists() and registry.stat().st_size < 8_000_000:
@@ -582,6 +724,8 @@ class Collector:
     def read_file(self, path, tool, fallback_sid, budget=512_000):
         if tool == "workbuddy" and not self.permitted_workbuddy(path):
             return 0, False
+        if tool == "workbuddy_state" and not self.permitted_workbuddy_state(path):
+            return 0, False
         p = Path(path)
         try:
             st = p.stat()
@@ -619,6 +763,11 @@ class Collector:
                     f.seek(pos)
                     break  # A partially written record will be read next time.
                 offset = f.tell()
+                if tool == "workbuddy_state":
+                    doc = workbuddy_transition(raw, p.stem)
+                    if doc:
+                        rows.append(doc)
+                    continue
                 try:
                     doc = json.loads(raw)
                 except (ValueError, UnicodeError):
@@ -635,12 +784,16 @@ class Collector:
                     sid = self.parser.claude(doc, data, fallback_sid) or sid
                 elif tool == "workbuddy":
                     sid = self.parser.workbuddy(doc, data, fallback_sid) or sid
+                elif tool == "lifecycle":
+                    self.parser.lifecycle(doc, data)
+                elif tool == "workbuddy_state":
+                    sid = self.parser.workbuddy_state(doc) or sid
                 else:
                     self.parser.hook(doc, data)
             if sid and (data.get("oversized_skipped") or data.get("malformed_skipped")):
                 self.store.update(sid, {"coverage": "partial_records"})
             self.store.save_file(path, tool, sid, inode, offset, data, st.st_mtime, st.st_size)
-        if tool == "hook" and offset == st.st_size:
+        if tool in ["hook", "lifecycle"] and offset == st.st_size:
             # Our own event spool is a transport, not a historical activity log.
             # Hold the same lock as the bridge and only drain a fully read file.
             with p.open("r+b") as spool:
@@ -698,13 +851,20 @@ class Collector:
         try:
             if force or now() - self.last_discovery > 20:
                 self.discover()
+            # A new desktop task must not wait twenty seconds for its first
+            # sandbox approval to be observed. Only enumerate SDK state logs here.
+            for path, sid in self.workbuddy_state_files():
+                self.discovered[path] = ("workbuddy_state", sid)
+            self.status["files"] = len(self.discovered)
             pending, spent = 0, 0
-            # Most recently updated sessions get a first pass before historical backfill.
+            # Read authoritative hooks before transcripts: Codex may flush its
+            # turn-complete record a few milliseconds after emitting Stop.
+            # Otherwise that newer record can suppress every hook in the batch.
             def modified(item):
                 try:
-                    return Path(item[0]).stat().st_mtime
+                    return (item[1][0] in ["hook", "lifecycle", "workbuddy_state"], Path(item[0]).stat().st_mtime)
                 except OSError:
-                    return 0
+                    return (False, 0)
             files = sorted(self.discovered.items(), key=modified, reverse=True)
             for path, (tool, sid) in files:
                 if self.stop_event.is_set():

@@ -131,7 +131,7 @@ class Store:
         row = self.db.execute("SELECT state,stage,state_at,state_source FROM sessions WHERE id=?", (sid,)).fetchone()
         if not row or at < row["state_at"]:
             return
-        if source == "record" and row["state_source"] == "hook":
+        if source == "record" and row["state_source"] in ["hook", "event"]:
             return
         changed = row["state"] != state or row["stage"] != stage
         self.update(sid, {"state": state, "stage": stage, "state_at": at, "state_source": source})
@@ -250,7 +250,9 @@ class Store:
             projects = [dict(r) for r in self.db.execute("SELECT project_id AS id,project_name AS name,COUNT(*) AS sessions FROM sessions GROUP BY project_id,project_name ORDER BY project_name")]
             unknown_roles = self.db.execute("SELECT COUNT(*) FROM visible_sessions WHERE role='unknown' AND last_event_at>=?", (start.timestamp(),)).fetchone()[0]
         counts = {"observed": len(cards), "online": sum(c["liveness"] == "online" for c in cards),
-                  "active": sum(c["state"] == "active" and not c["stale"] and c["liveness"] == "online" for c in cards),
+                  "active": sum(c["state"] == "active" and not c["stale"] and
+                                (c["liveness"] == "online" or (c["liveness"] != "offline" and c["state_source"] in ["hook", "event"]))
+                                for c in cards),
                   "waiting": sum(c["state"] in ["waiting_user", "waiting_approval"] for c in cards),
                   "error": sum(c["state"] == "error" for c in cards),
                   "unknown": sum(c["state"] == "unknown" for c in cards), "unknown_roles": unknown_roles}
