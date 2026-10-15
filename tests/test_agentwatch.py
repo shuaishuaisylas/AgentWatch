@@ -437,7 +437,10 @@ class NavigationTests(Fixture):
         def runner(command,**options):
             commands.append(command)
             return SimpleNamespace(returncode=0,stdout="focused")
-        session = {"tool":"codex","source_id":"safe-session","liveness":"online","tty":"/dev/ttys123"}
+        rollout = self.root / "synthetic-rollout.jsonl"
+        rollout.write_text('{"type":"synthetic"}\n')
+        session = {"tool":"codex","source_id":"safe-session","liveness":"online","tty":"/dev/ttys123",
+                   "_rollout_path": str(rollout)}
         with patch("agentwatch.navigation.sys.platform","darwin"):
             jump(session,"codex",runner)
             jump(session,"codex_vscode",runner)

@@ -32,6 +32,7 @@ class Store:
               reported_total INTEGER, coverage TEXT DEFAULT 'observed', last_hook_at REAL,
               archived INTEGER NOT NULL DEFAULT 0, archive_source TEXT NOT NULL DEFAULT '',
               internal INTEGER NOT NULL DEFAULT 0,
+              internal_memory INTEGER NOT NULL DEFAULT 0,
               seen_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS usage (
@@ -73,14 +74,17 @@ class Store:
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(sessions)")}
         for name, declaration in [("archived", "INTEGER NOT NULL DEFAULT 0"),
                                   ("archive_source", "TEXT NOT NULL DEFAULT ''"),
-                                  ("internal", "INTEGER NOT NULL DEFAULT 0")]:
+                                  ("internal", "INTEGER NOT NULL DEFAULT 0"),
+                                  ("internal_memory", "INTEGER NOT NULL DEFAULT 0")]:
             if name not in columns:
                 self.db.execute("ALTER TABLE sessions ADD COLUMN " + name + " " + declaration)
         self.db.executescript("""
             CREATE INDEX IF NOT EXISTS sessions_parent ON sessions(parent_id);
-            CREATE VIEW IF NOT EXISTS visible_sessions AS
+            CREATE INDEX IF NOT EXISTS files_session ON files(tool,session_id);
+            DROP VIEW IF EXISTS visible_sessions;
+            CREATE VIEW visible_sessions AS
               WITH RECURSIVE hidden(id) AS (
-                SELECT id FROM sessions WHERE archived=1 OR internal=1
+                SELECT id FROM sessions WHERE archived=1 OR internal=1 OR internal_memory=1
                 UNION
                 SELECT s.id FROM sessions s JOIN hidden h ON s.parent_id=h.id WHERE s.role='child'
               )
@@ -107,7 +111,7 @@ class Store:
             "alias", "started_at", "last_event_at", "state", "stage", "state_at", "state_source", "liveness", "pid",
             "process_birth", "tty", "context_used", "context_limit", "context_at", "context_estimated", "context_invalid_at",
             "reported_input", "reported_output", "reported_cache_read", "reported_cache_write", "reported_total",
-            "coverage", "last_hook_at", "seen_at", "archived", "archive_source", "internal",
+            "coverage", "last_hook_at", "seen_at", "archived", "archive_source", "internal", "internal_memory",
         }
         values = {k: v for k, v in values.items() if k in allowed}
         if values:
@@ -242,12 +246,23 @@ class Store:
                 card["context_percent"] = used / limit * 100 if used is not None and limit and limit > 0 else None
                 card["jump"] = self.jump_info(card)
                 card["worktree_name"] = Path(card["worktree"]).name if card["worktree"] else None
-                for key in ["cwd", "worktree", "pid", "process_birth", "tty", "reported_input", "reported_output", "reported_cache_read", "reported_cache_write", "reported_total", "archived", "archive_source", "internal"]:
+                directory = card["worktree"] or card["cwd"]
+                if directory:
+                    directory_path = Path(directory)
+                    try:
+                        directory = str(Path("~") / directory_path.relative_to(Path.home()))
+                    except ValueError:
+                        pass
+                card["working_directory"] = directory or None
+                if card["tool"] == "codex" and card["last_hook_at"] and not self.db.execute(
+                        "SELECT 1 FROM files WHERE tool='codex' AND session_id=? AND offset>0 LIMIT 1", (card["id"],)).fetchone():
+                    card["coverage"] = "status_only"
+                for key in ["cwd", "worktree", "pid", "process_birth", "tty", "reported_input", "reported_output", "reported_cache_read", "reported_cache_write", "reported_total", "archived", "archive_source", "internal", "internal_memory"]:
                     card.pop(key, None)
                 cards.append(card)
             cards.sort(key=lambda c: (priority.get(c["state"], 3), -(c["last_event_at"] or 0)))
             activity = [dict(r) for r in self.db.execute("SELECT a.id,a.at,a.kind,a.label,s.tool,s.source_id,s.project_name,s.id AS session_id FROM activity a JOIN visible_sessions s ON s.id=a.session_id WHERE " + where + " AND a.at>=? AND a.at<? ORDER BY a.at DESC LIMIT 24", (*values, start.timestamp(), end.timestamp()))]
-            projects = [dict(r) for r in self.db.execute("SELECT project_id AS id,project_name AS name,COUNT(*) AS sessions FROM sessions GROUP BY project_id,project_name ORDER BY project_name")]
+            projects = [dict(r) for r in self.db.execute("SELECT s.project_id AS id,s.project_name AS name,COUNT(*) AS sessions FROM sessions s WHERE s.internal_memory=0 OR EXISTS (SELECT 1 FROM usage u WHERE u.session_id=s.id) GROUP BY s.project_id,s.project_name ORDER BY s.project_name")]
             unknown_roles = self.db.execute("SELECT COUNT(*) FROM visible_sessions WHERE role='unknown' AND last_event_at>=?", (start.timestamp(),)).fetchone()[0]
         counts = {"observed": len(cards), "online": sum(c["liveness"] == "online" for c in cards),
                   "active": sum(c["state"] == "active" and not c["stale"] and
@@ -260,11 +275,26 @@ class Store:
                 "truncated": len(cards) > 160, "activity": activity, "projects": projects, "scan": scan_status,
                 "today": self.stats(dict(args, period="day", date=day_of(current)), current)}
 
-    @staticmethod
-    def jump_info(card):
+    def codex_rollout(self, card):
+        """A lifecycle ID alone is not evidence of a restorable conversation."""
+        with self.lock:
+            rows = self.db.execute("SELECT path FROM files WHERE tool='codex' AND session_id=? AND offset>0", (card["id"],)).fetchall()
+            for row in rows:
+                path = Path(row["path"])
+                try:
+                    if path.is_absolute() and path.suffix == ".jsonl" and path.is_file() and path.stat().st_size > 0:
+                        return str(path)
+                except (OSError, ValueError):
+                    continue
+        return None
+
+    def jump_info(self, card):
         if card["tool"] == "workbuddy":
             return {"kind": "workbuddy", "label": "打开 WorkBuddy", "precision": "应用", "available": True}
         if card["tool"] == "codex":
+            if any(card.get(key) for key in ["archived", "internal", "internal_memory"]) or not self.codex_rollout(card):
+                return {"kind": "none", "label": "会话记录不可用", "precision": None, "available": False,
+                        "reason": "未发现可恢复的本地会话记录；状态上报本身不能用于恢复对话。"}
             if card["surface"] == "vscode":
                 return {"kind": "codex_vscode", "label": "在 VS Code 打开", "precision": "会话路由", "available": True}
             return {"kind": "codex", "label": "在 Codex 打开", "precision": "指定会话", "available": True}

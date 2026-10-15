@@ -45,6 +45,7 @@ class DemoCollector:
             ("codex", "error", "child", "error", "演示：构建检查失败", "online", "vscode", "构建检查", 72000, 200000, 900),
             ("workbuddy", "research", "unknown", "unknown", "最近阶段：整理演示资料", "unknown", "desktop", "市场资料整理", None, None, None),
             ("codex", "complete", "main", "idle", "演示回复已结束", "online", "desktop", "文档校对", 18000, 200000, 30),
+            ("codex", "status-only", "unknown", "active", "演示：仅收到状态上报", "unknown", "desktop", "等待会话记录", None, None, None),
         ]
         self._seed(root)
 
@@ -61,6 +62,9 @@ class DemoCollector:
                 self.store.state(sid, state, stage, current, "demo")
                 self.store.update(sid, {"liveness": online, "started_at": current - 3600,
                                         "coverage": "observed"})
+                if source == "status-only":
+                    self.store.update(sid, {"last_hook_at": current, "state_source": "hook"})
+                    continue
                 # A month of deterministic, artificial events exercises all date views.
                 for day in range(30):
                     at = current - day * 86400 - index * 60

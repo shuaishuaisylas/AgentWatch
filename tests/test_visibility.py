@@ -184,6 +184,81 @@ class VisibilityTests(unittest.TestCase):
         self.store.update(fork, {"parent_id": parent, "role": "main", "liveness": "online"})
         self.assertEqual([c["id"] for c in self.snapshot()["sessions"]], [fork])
 
+    def hook_only(self, identity, cwd):
+        sid = self.store.session("codex", identity)
+        self.store.metadata(sid, str(cwd), surface="desktop")
+        self.store.state(sid, "active", "Synthetic tool returned", AT, "hook")
+        self.store.update(sid, {"last_hook_at": AT, "liveness": "online"})
+        return sid
+
+    def test_unregistered_memory_status_and_descendants_are_hidden_without_erasing_history(self):
+        self.index([])
+        sid = self.hook_only("memory-status", self.codex / "memories")
+        child = self.hook_only("memory-child", self.root / "helper")
+        self.store.update(child, {"role": "child", "parent_id": sid})
+        self.store.update(sid, {"alias": "Synthetic retained name"})
+        self.store.usage(sid, "synthetic-usage", AT, 12, 3)
+        history = self.store.stats({"role": "all", "date": "2026-10-15"}, AT)
+        self.scan()
+        snap = self.snapshot()
+        self.assertEqual(snap["sessions"], [])
+        self.assertEqual(snap["activity"], [])
+        self.assertTrue(all(value == 0 for value in snap["counts"].values()))
+        self.assertEqual(snap["today"], history)
+        row = self.store.db.execute("SELECT alias,internal_memory FROM sessions WHERE id=?", (sid,)).fetchone()
+        self.assertEqual(tuple(row), ("Synthetic retained name", 1))
+        self.assertTrue(any(p["name"] == "memories" for p in snap["projects"]))
+
+    def test_only_managed_memory_status_is_hidden_and_not_listed_as_a_new_project(self):
+        self.index([])
+        memory = self.hook_only("managed", self.codex / "memories" / "scratch")
+        ordinary = self.hook_only("ordinary", self.root / "projects" / "memories")
+        neighbor = self.hook_only("neighbor", self.codex / "memories-copy")
+        self.scan()
+        snap = self.snapshot()
+        self.assertEqual({c["id"] for c in snap["sessions"]}, {ordinary, neighbor})
+        self.assertNotIn("scratch", {p["name"] for p in snap["projects"]})
+        self.assertEqual(self.store.db.execute("SELECT internal_memory FROM sessions WHERE id=?", (memory,)).fetchone()[0], 1)
+
+    def test_registered_or_known_user_session_in_memory_directory_stays_visible(self):
+        indexed = self.hook_only("registered-memory", self.codex / "memories")
+        known = self.hook_only("known-user", self.codex / "memories")
+        self.store.update(known, {"role": "main"})
+        self.index([("registered-memory", "", "unknown", "user", 0)])
+        self.scan()
+        self.assertEqual({c["id"] for c in self.snapshot()["sessions"]}, {indexed, known})
+        # Losing the index temporarily must not hide a previously recognized thread.
+        (self.codex / "state_5.sqlite").unlink()
+        self.scan()
+        self.assertEqual({c["id"] for c in self.snapshot()["sessions"]}, {indexed, known})
+
+    def test_rollout_arrival_restores_visibility_and_later_deletion_only_disables_jump(self):
+        self.index([])
+        sid = self.hook_only("late-record", self.codex / "memories")
+        self.scan()
+        self.assertEqual(self.snapshot()["sessions"], [])
+        path = self.transcript("late-record", source="unknown")
+        self.scan()
+        card = self.snapshot()["sessions"][0]
+        self.assertEqual(card["id"], sid)
+        self.assertTrue(card["jump"]["available"])
+        self.assertNotEqual(card["coverage"], "status_only")
+        path.unlink()
+        self.scan()
+        card = self.snapshot()["sessions"][0]
+        self.assertEqual(card["id"], sid)
+        self.assertFalse(card["jump"]["available"])
+
+    def test_unavailable_index_after_restart_does_not_newly_hide_a_registered_user(self):
+        sid = self.hook_only("registered-memory", self.codex / "memories")
+        self.index([("registered-memory", "", "unknown", "user", 0)])
+        self.scan()
+        (self.codex / "state_5.sqlite").unlink()
+        self.collector = Collector(self.store, self.codex, self.root / "claude", self.root / "data",
+                                   self.root / "desktop", workbuddy_home=self.root / "workbuddy")
+        self.scan()
+        self.assertEqual([c["id"] for c in self.snapshot()["sessions"]], [sid])
+
     def test_existing_database_migrates_without_losing_aliases_or_history(self):
         sid = self.store.session("codex", "legacy")
         self.store.update(sid, {"alias": "Existing name"})
@@ -191,10 +266,10 @@ class VisibilityTests(unittest.TestCase):
         self.store.db.commit()
         original = self.store.db.execute("SELECT sql FROM sqlite_master WHERE name='sessions'").fetchone()[0]
         columns = [r[1] for r in self.store.db.execute("PRAGMA table_info(sessions)")
-                   if r[1] not in {"archived", "archive_source", "internal"}]
+                   if r[1] not in {"archived", "archive_source", "internal", "internal_memory"}]
         self.store.db.execute("DROP VIEW visible_sessions")
         self.store.db.execute("ALTER TABLE sessions RENAME TO old_sessions")
-        legacy_schema = original.replace("archived INTEGER NOT NULL DEFAULT 0, archive_source TEXT NOT NULL DEFAULT '',", "").replace("internal INTEGER NOT NULL DEFAULT 0,", "")
+        legacy_schema = original.replace("archived INTEGER NOT NULL DEFAULT 0, archive_source TEXT NOT NULL DEFAULT '',", "").replace("internal INTEGER NOT NULL DEFAULT 0,", "").replace("internal_memory INTEGER NOT NULL DEFAULT 0,", "")
         self.store.db.execute(legacy_schema)
         names = ",".join(columns)
         self.store.db.execute("INSERT INTO sessions (" + names + ") SELECT " + names + " FROM old_sessions")
@@ -204,7 +279,7 @@ class VisibilityTests(unittest.TestCase):
         self.store = Store(self.root / "data/watch.sqlite")
         self.assertEqual(self.snapshot()["sessions"][0]["alias"], "Existing name")
         self.assertEqual(self.store.stats({"role": "all", "date": "2026-10-15"}, AT)["totals"]["total"], 15)
-        self.assertEqual(self.store.db.execute("SELECT archived,internal FROM sessions").fetchone()[:], (0, 0))
+        self.assertEqual(self.store.db.execute("SELECT archived,internal,internal_memory FROM sessions").fetchone()[:], (0, 0, 0))
 
 
 if __name__ == "__main__":

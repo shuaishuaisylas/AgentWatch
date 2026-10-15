@@ -546,6 +546,8 @@ class Collector:
         self.thread = None
         self.discovered = {}
         self.codex_archive_states = {}
+        self.codex_index_sessions = set()
+        self.codex_index_available = False
         self.last_discovery = self.last_probe = 0
         self.quota_bootstrapped = False
         self.status = {"running": False, "files": 0, "pending": 0, "read_bytes": 0, "last_scan": None, "errors": 0}
@@ -608,6 +610,7 @@ class Collector:
         files = {}
         excluded = set()
         self.codex_archive_states = {}
+        self.codex_index_available = False
         index = self.codex_home / "state_5.sqlite"
         if index.exists():
             try:
@@ -616,6 +619,8 @@ class Collector:
                     cols = {r[1] for r in db.execute("PRAGMA table_info(threads)")}
                     wanted = [c for c in ["id", "rollout_path", "cwd", "source", "originator", "cli_version", "git_branch", "created_at", "created_at_ms", "archived", "thread_source"] if c in cols]
                     rows = db.execute("SELECT " + ",".join(wanted) + " FROM threads").fetchall()
+                    self.codex_index_sessions = {safe_id(row["id"]) for row in rows if safe_id(row["id"])}
+                    self.codex_index_available = True
                     with self.store.lock, self.store.db:
                         for raw in rows:
                             r = dict(raw)
@@ -691,12 +696,35 @@ class Collector:
                 self.status["errors"] += 1
         self.discovered = files
         self.sync_codex_archives()
+        self.sync_codex_memory_visibility()
         if not self.quota_bootstrapped:
             with self.store.lock, self.store.db:
                 backfill_codex(self.store, files)
             self.quota_bootstrapped = True
         self.status["files"] = len(files)
         self.last_discovery = now()
+
+    def sync_codex_memory_visibility(self):
+        # Codex may emit hooks for non-persisted work in its managed memory
+        # directory. A registered user thread or parsed rollout remains visible.
+        memory_root = (self.codex_home / "memories").resolve()
+        with self.store.lock, self.store.db:
+            for row in self.store.db.execute("SELECT id,source_id,cwd,role,internal_memory FROM sessions WHERE tool='codex'").fetchall():
+                transient = False
+                if row["role"] == "unknown" and row["source_id"] not in self.codex_index_sessions:
+                    try:
+                        managed_memory = bool(row["cwd"]) and Path(row["cwd"]).resolve().is_relative_to(memory_root)
+                    except (OSError, ValueError, RuntimeError):
+                        managed_memory = False
+                    if managed_memory:
+                        collected = self.store.db.execute("SELECT 1 FROM files WHERE tool='codex' AND session_id=? AND offset>0 LIMIT 1", (row["id"],)).fetchone()
+                        transient = not collected
+                # Absence is meaningful only after a successful index read.
+                # Keep prior visibility through unavailable indexes/restarts.
+                if transient and not self.codex_index_available:
+                    continue
+                if bool(row["internal_memory"]) != bool(transient):
+                    self.store.update(row["id"], {"internal_memory": int(transient)})
 
     def sync_codex_archives(self):
         # A moved transcript may already be at EOF. Visibility must be refreshed
@@ -880,6 +908,7 @@ class Collector:
                     self.status["errors"] += 1
             self.status.update(pending=pending, read_bytes=self.status["read_bytes"] + spent, last_scan=now())
             self.sync_codex_archives()
+            self.sync_codex_memory_visibility()
             if force or now() - self.last_probe > 8:
                 self.probe()
             # Only activity labels, never source records, expire at the local day boundary.

@@ -193,6 +193,12 @@ class Handler(BaseHTTPRequestHandler):
                             self.server.store.update(session["id"], {"alias": short_text(body.get("alias"))})
                         return self.json_response(200, {"saved": True})
                 allowed = self.server.store.jump_info(session)
+                with self.server.store.lock:
+                    visible = self.server.store.db.execute("SELECT 1 FROM visible_sessions WHERE id=?", (session["id"],)).fetchone()
+                if not visible or not allowed["available"]:
+                    return self.json_response(400, {"error": allowed.get("reason") or "此会话当前没有可靠的跳转入口。"})
+                if session["tool"] == "codex":
+                    session["_rollout_path"] = self.server.store.codex_rollout(session)
                 kind = body.get("kind", allowed["kind"])
                 # Only known, generated navigation kinds; no arbitrary path or command execution.
                 if kind != allowed["kind"] and not (kind == "codex" and session["tool"] == "codex"):

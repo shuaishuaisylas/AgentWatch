@@ -65,6 +65,10 @@ Codex 已归档会话及其所有后代不进入实时会话、计数或动态�
 
 隐藏只影响实时可见性，不删除会话、别名、采集游标或用量；`stats` 和 `snapshot.today` 保留已归档会话的历史统计。`projects` 继续提供历史项目，方便按项目查历史；不能用历史会话数判断当前可见数量。
 
+配置的 Codex 数据目录中 `memories` 及其子目录可能产生只有状态上报的临时 ID。仅当其角色未知、未在本地线程索引登记、从未关联已解析的会话文件时，隐藏此记录及子 Agent 后代；已登记或有记录的用户会话、其他路径中名为 `memories` 的项目不受影响。以后发现索引或会话记录会重新展示；已采集过文件但后来文件消失，只禁用跳转，不按临时记录隐藏。临时记忆记录若没有历史用量，也不加入项目列表；历史用量与别名仍保留。
+
+临时记忆判断需要成功读取本地线程索引；索引缺失或不可读时不新增此类隐藏，重启也保留先前可见性。明确的新索引登记、角色或已解析文件可以撤销临时隐藏。
+
 ### `GET /api/snapshot?tool=all&project=all&role=all`
 
 主要结构：
@@ -104,7 +108,8 @@ Codex 已归档会话及其所有后代不进入实时会话、计数或动态�
     "coverage": "observed",
     "usage": {"input": 1200, "output": 300, "cache_read": 400, "cache_write": null, "observed_total": 1500, "today": 1500, "cumulative": 1500},
     "jump": {"kind": "none", "label": "演示模式", "precision": null, "available": false},
-    "worktree_name": null
+    "worktree_name": null,
+    "working_directory": "/example/projects/演示项目"
   }],
   "truncated": false,
   "activity": [],
@@ -123,8 +128,10 @@ Codex 已归档会话及其所有后代不进入实时会话、计数或动态�
 - 仅当 `context_percent` 有效时绘制百分比；`context_used` 有值但分母未知时只展示 token 数。WorkBuddy 不提供上下文快照。
 - `state_source` 包括本地记录 `record`、明确事件 `event`、Codex / Claude / WorkBuddy 上报 `hook`、进程观测 `process`；演示可能为 `demo`，不能把它当真实来源。来源已使用 hooks 后，原始记录不覆盖其状态。
 - WorkBuddy 桌面沙箱批准通过 SDK 状态机日志补充，来源为 `event`。只接受明确的转换信号，`PERMISSION_REQUESTED` 对应待批准，`PERMISSION_RESOLVED` 对应继续执行，`TURN_COMPLETED` 对应本轮空闲；不能把工具返回或 `PHASE_IDLE` 当成整轮结束。提问工具的 hook 可细分为等待回复。已收到明确 hook/event 后，普通记录不能降级覆盖它；桌面会话有原生状态来源时，CLI 工作进程退出不会将整条会话改成运行结束。
-- `coverage` 当前可能为 `observed`、`partial_baseline`、`counter_reset`、`partial_usage`、`partial_records`、`missing_time`、`missing_request_id`；新增值应有通用显示回退。
-- `jump` 使用服务端给出的按钮文字、可用性和精度；真实模式可能为 `codex`、`codex_vscode`、`terminal`、`project`、`claude`、`workbuddy` 或 `none`。打开应用与定位会话是不同精度。
+- `coverage` 当前可能为 `observed`、`status_only`、`partial_baseline`、`counter_reset`、`partial_usage`、`partial_records`、`missing_time`、`missing_request_id`；新增值应有通用显示回退。`status_only` 表示 Codex 已上报状态，但尚未关联已解析的会话记录，不表示 token 为 0，也不证明会话可恢复。
+- `working_directory` 是识别到的项目根目录或工作树路径，字符串或 null；本机用户主目录缩为 `~`。它不是每次命令执行的当前子目录。`worktree_name` 保持兼容，前端优先显示新字段，旧后端缺失时回退到工作树名或未知。
+- `jump` 使用服务端给出的按钮文字、可用性和精度；真实模式可能为 `codex`、`codex_vscode`、`terminal`、`project`、`claude`、`workbuddy` 或 `none`。可选 `reason` 是禁用原因，字符串；前端容忍字段缺失。打开应用与定位会话是不同精度。
+- Codex 跳转需要采集器已关联的非空、仍存在的本地 `.jsonl` 会话文件；只有 hook ID 或线程索引不启用跳转。缺失时 `available=false`、`kind=none`、`precision=null`。`POST /api/jump` 的默认和显式 Codex 入口均执行同一校验，并拒绝实时隐藏的会话及后代；打开前再次核验文件存在。校验只能确认本地记录存在，不能保证客户端恢复成功。
 
 ### `GET /api/stats?period=week&date=2026-10-15&role=all`
 
