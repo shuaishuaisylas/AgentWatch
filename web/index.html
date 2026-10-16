@@ -63,10 +63,10 @@
         </section>
 
         <section id="view-settings" class="view" hidden>
-          <div class="settings-intro"><span class="privacy-badge">◇ LOCAL FIRST</span><h2>按你原来的方式使用 Agent。</h2><p>看板从本机记录发现会话。启用并收到状态上报后，可区分 Agent 正在工作、等待你确认或空闲。</p></div>
+          <div class="settings-intro"><span class="privacy-badge">◇ LOCAL FIRST</span><h2>按你原来的方式使用 Agent。</h2><p>看板从本机记录或状态事件发现会话。启用后以实际收到的上报为准，各平台覆盖范围见下方说明。</p></div>
           <div id="source-panels" class="source-panels"></div>
           <div class="enhance-panel"><div class="enhance-heading"><span class="tool-icon claude large">✳</span><div><h2>Claude Code 准确状态</h2><p>区分正在执行、等待批准、等待回复与本轮结束。</p></div><span id="enhance-status" class="status-chip unknown">读取设置中</span></div><div class="enhance-content"><p>新增后台状态上报，保留现有设置。启用前可查看新增内容；系统会备份，之后可以撤销。</p><label class="checkbox-row"><input type="checkbox" id="include-statusline"><span>同时上报终端上下文和订阅额度<small>保留已有状态栏输出；订阅额度需来源在回复后实际报告。</small></span></label><div class="enhance-actions"><button class="button primary" id="enable-claude">预览并启用</button><button class="button secondary" id="restore-claude" hidden>撤销 AgentWatch 设置</button><span id="hook-last-seen" class="muted"></span></div><div class="settings-note">已启动的会话不一定会重新读取设置。启用后，新启动的本机 Claude Code 会话开始上报；终端、VS Code 和桌面 Code 以各自实际生效情况为准。</div></div></div>
-          <div class="settings-bottom"><div><h3>只保留必要信息</h3><p>会话身份、项目、状态、数字用量与额度快照。不会保存提示词、回复、代码、工具参数或凭据。</p><div class="data-location" id="data-location"></div></div><div><h3>采集边界</h3><p>状态与订阅需要来源实际报告，缺失时不估算。Codex 状态上报需首次审阅信任；WorkBuddy 积分查询需要官方授权。豆包工作、Claude Cowork 和普通 Chat 尚未接入。</p></div></div>
+          <div class="settings-bottom"><div><h3>只保留必要信息</h3><p>会话身份、项目、状态、数字用量与额度快照。不会保存提示词、回复、代码、工具参数或凭据。</p><div class="data-location" id="data-location"></div></div><div><h3>采集边界</h3><p>状态与订阅需要来源实际报告，缺失时不估算。Codex 状态上报需首次审阅信任；WorkBuddy 积分查询需要官方授权。Cursor 仅接入状态，等待确认覆盖与用量未知。豆包工作、Claude Cowork 和普通 Chat 尚未接入。</p></div></div>
         </section>
         <footer><span>所有数字仅代表看板可观测范围</span><span>AgentWatch <span class="footer-dot">·</span> 本机 Agent 看板</span></footer>
       </div>

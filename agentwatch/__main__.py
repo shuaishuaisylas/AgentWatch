@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--claude-home", default=os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
     parser.add_argument("--desktop-home", default=str(Path.home() / "Library/Application Support/Claude"))
     parser.add_argument("--workbuddy-home", default=os.environ.get("WORKBUDDY_HOME", str(Path.home() / ".workbuddy")))
+    parser.add_argument("--cursor-home", default=str(Path.home() / ".cursor"), help="Cursor 用户 hooks 目录")
     parser.add_argument("--open", action="store_true", help="启动后打开浏览器")
     parser.add_argument("--demo", action="store_true", help="使用临时人工样例，不读取本机 Agent 或设置")
     parser.add_argument("--scan-once", action="store_true", help="只执行一轮元数据采集")
@@ -42,7 +43,7 @@ def main():
             private_dir(data)
             store = Store(data / "agentwatch.sqlite")
             cleanup.callback(store.close)
-            collector = Collector(store, Path(args.codex_home).expanduser().resolve(), Path(args.claude_home).expanduser().resolve(), data, Path(args.desktop_home).expanduser().resolve(), Path(args.workbuddy_home).expanduser().resolve())
+            collector = Collector(store, Path(args.codex_home).expanduser().resolve(), Path(args.claude_home).expanduser().resolve(), data, Path(args.desktop_home).expanduser().resolve(), Path(args.workbuddy_home).expanduser().resolve(), Path(args.cursor_home).expanduser().resolve())
             config = ClaudeConfiguration(collector.claude_home, data)
         if args.scan_once:
             collector.scan(force=True)

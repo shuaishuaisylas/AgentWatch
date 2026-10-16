@@ -166,7 +166,8 @@ class SubscriptionTests(unittest.TestCase):
             client.stop()
             result = client.snapshot()
             self.assertTrue(result["demo"])
-            self.assertTrue(all(p["limits"] for p in result["platforms"]))
+            self.assertTrue(all(p["limits"] for p in result["platforms"] if p["tool"] != "cursor"))
+            self.assertEqual(next(p for p in result["platforms"] if p["tool"] == "cursor")["limits"], [])
             fetcher.assert_not_called()
 
 

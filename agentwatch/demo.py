@@ -31,8 +31,9 @@ class DemoCollector:
         self.claude_home = root / "sources" / "claude"
         self.desktop_home = root / "sources" / "desktop"
         self.workbuddy_home = root / "sources" / "workbuddy"
+        self.cursor_home = root / "sources" / "cursor"
         for path in [self.codex_home, self.claude_home, self.desktop_home,
-                     self.workbuddy_home / "projects"]:
+                     self.workbuddy_home / "projects", self.cursor_home]:
             path.mkdir(parents=True, mode=0o700)
         self.wake = threading.Event()
         self.last_discovery = 0
@@ -52,6 +53,7 @@ class DemoCollector:
             ("codex", "copy", "child", "idle", "演示文案检查已结束", "offline", "vscode", "文案检查", 9000, 200000, 30),
             ("codex", "offline", "child", "active", "演示：离线前的执行阶段", "offline", "terminal", "离线任务样例", None, None, None),
             ("codex", "verification", "child", "waiting_user", "演示：等待你确认验收范围", "online", "desktop", "交互验收", None, None, None),
+            ("cursor", "cursor-observed", "main", "active", "演示：Cursor 工具返回 · 继续处理", "unknown", "desktop", "Cursor 界面整理", None, None, None),
         ]
         self.parents = {"codex:demo-verification": "codex:demo-implementation"}
         self.state_ages = {"codex:demo-audit": 900}
@@ -64,15 +66,34 @@ class DemoCollector:
             for index, sample in enumerate(self.samples):
                 tool, source, role, state, stage, online, surface, alias, used, limit, age = sample
                 sid = self.store.session(tool, "demo-" + source)
-                self.store.metadata(sid, str(root / "projects" / ("示例产品" if index < 4 or role == "child" else "示例研究")),
-                                    role=role, surface=surface, alias=alias, version="演示样例")
+                project = "g-p-demo-title-project" if source == "complete" else "示例产品" if index < 4 or role == "child" else "示例研究"
+                # Client project labels differ from filesystem folder names.
+                # All names are artificial and independent of installed clients.
+                self.store.metadata(sid, str(root / "projects" / project), role=role, surface=surface,
+                                    alias="" if source == "complete" else alias,
+                                    project_display_name=("演示长项目名称用于检查悬停展开与十字符限制" if source == "complete"
+                                                          else "演示界面项目" if tool == "codex" else None),
+                                    session_title="演示会话 · " + alias, version="演示样例")
                 if role == "child":
                     parent = self.parents.get(sid, "codex:demo-design" if tool == "codex" else "claude:demo-approval")
                     self.store.update(sid, {"parent_id": parent})
                 self.store.state(sid, state, stage, current - self.state_ages.get(sid, 0),
                                  self.state_sources.get(sid, "demo"))
+                if source in {"approval", "question", "audit", "verification"}:
+                    # Explicitly artificial human-action evidence, independent of
+                    # execution state; multiple children still count as one root.
+                    kind = "waiting_approval" if source in {"approval", "audit"} else "waiting_user"
+                    self.store.open_interaction(sid, "demo-manual-" + source, 0, kind,
+                                                current - self.state_ages.get(sid, 0),
+                                                tool_name="artificial_manual_action", asynchronous=True)
+                if source in {"complete", "copy"}:
+                    self.store.complete(sid, current - 45)
                 self.store.update(sid, {"liveness": online, "started_at": current - 3600,
                                         "coverage": "observed"})
+                if tool == "cursor":
+                    self.store.update(sid, {"coverage": "status_only", "attention_covered": 0,
+                                            "last_hook_at": current, "state_source": "hook"})
+                    continue
                 if source == "status-only":
                     self.store.update(sid, {"last_hook_at": current, "state_source": "hook"})
                     continue

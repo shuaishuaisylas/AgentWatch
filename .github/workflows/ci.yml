@@ -32,4 +32,18 @@ jobs:
       - name: Frontend syntax
         run: node --check web/app.js
       - name: Launcher syntax
-        run: zsh -n 启动看板.command
+        run: |
+          zsh -n 启动看板.command
+          zsh -n 启动胶囊.command
+          for script in desktop/scripts/*.sh; do zsh -n "$script"; done
+
+  desktop:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Swift state and transport tests
+        run: ./desktop/scripts/test.sh
+      - name: Controller integration with artificial responses
+        run: ./desktop/scripts/test-controller-read.sh

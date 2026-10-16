@@ -47,6 +47,8 @@ def sanitize(doc, tool, at=None, process=None):
         row["notification_type"] = doc["notification_type"]
     if doc.get("source") in ["startup", "resume", "clear", "compact", "fork"]:
         row["source"] = doc["source"]
+    if doc.get("stop_reason") in ["completed", "cancelled", "interrupted", "aborted", "error"]:
+        row["stop_reason"] = doc["stop_reason"]
     if process:
         row.update(pid=process["pid"], process_birth=process["birth"], tty=process["tty"], surface=process["surface"])
     return row

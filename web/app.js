@@ -10,7 +10,8 @@ const today = () => new Date().toLocaleDateString("sv-SE", {timeZone:"Asia/Shang
 const tools = {
   codex:{name:"Codex",symbol:"C",entry:"桌面 · VS Code"},
   claude:{name:"Claude Code",symbol:"✳",entry:"终端 · 编辑器 · 桌面 Code"},
-  workbuddy:{name:"WorkBuddy",symbol:"W",entry:"桌面 · 本地只读"}
+  workbuddy:{name:"WorkBuddy",symbol:"W",entry:"桌面 · 本地只读"},
+  cursor:{name:"Cursor",symbol:"↗",entry:"编辑器 · 状态上报"}
 };
 const toolName = tool => tools[tool]?.name || tool || "未知工具";
 const toolIcon = (tool,large=false) => `<span class="tool-icon ${esc(tool)}${large ? " large" : ""}">${esc(tools[tool]?.symbol || "A")}</span>`;
@@ -18,7 +19,7 @@ const surfaces = {desktop:"桌面应用",vscode:"VS Code",terminal:"本机终端
 const surfaceName = card => card.tool === "claude" && card.surface === "desktop" ? "桌面 Code" : surfaces[card.surface] || "入口待识别";
 const labels = {active:"执行中",waiting_user:"等待回复",waiting_approval:"等待批准",idle:"空闲",ended:"运行结束",unknown:"待确认",error:"出现错误"};
 const roles = {main:"主会话",child:"子 Agent",unknown:"关系未知"};
-const state = {view:"live",status:"all",snapshot:null,snapshotRequest:0,request:0,history:null,historyTool:null,heatmapFocus:null,detail:null};
+const state = {view:"live",status:"all",snapshot:null,integrations:null,snapshotRequest:0,request:0,history:null,historyTool:null,heatmapFocus:null,detail:null};
 let toastTimer;
 
 async function api(path, body, extra={}) {
@@ -85,6 +86,7 @@ function renderSnapshot(data) {
   if (data.scan.pending) notices.push(`正在回读历史记录，${data.scan.pending} 个文件尚未读完；统计会继续更新。`);
   if (c.unknown + children.unknown) notices.push("仅凭进程在线无法确认正在执行；缺少准确状态的会话标记为“待确认”。");
   if (c.unknown_roles) notices.push(`全局还有 ${c.unknown_roles} 个今日会话的关系未知，未计入主会话。`);
+  if ((data.sessions || []).some(card => card.tool === "cursor")) notices.push("Cursor 当前仅有状态事件；等待回复、系统审批、子 Agent 与用量尚未覆盖，待处理计数不代表已完整覆盖 Cursor。");
   if (data.scan.errors) notices.push("部分来源读取未完成，可刷新重试；已采集的数据仍可查看。");
   if (data.truncated) notices.push("当前展示最优先的 160 个主会话，可按工具缩小范围。");
   $("#coverage-banner").hidden = !notices.length;
@@ -97,11 +99,12 @@ function renderSnapshot(data) {
 }
 function contextMarkup(card) {
   const pct = card.context_percent;
-  const label = card.context_used == null ? "等待有效快照" : pct == null ? `${compact(card.context_used)} token · 分母未知` : `${Math.min(pct,999).toFixed(1)}% · ${compact(card.context_used)} / ${compact(card.context_limit)}`;
-  const note = card.context_used == null ? "来源未报告有效快照；缺失时不估算百分比" : `${card.context_estimated ? "最近请求的输入量" : "来源报告的最近快照"} · ${time(card.context_at)}${card.context_stale ? " · 快照较旧" : ""}`;
+  const label = card.context_used == null ? card.tool === "cursor" ? "未接入上下文快照" : "等待有效快照" : pct == null ? `${compact(card.context_used)} token · 分母未知` : `${Math.min(pct,999).toFixed(1)}% · ${compact(card.context_used)} / ${compact(card.context_limit)}`;
+  const note = card.context_used == null ? card.tool === "cursor" ? "当前仅接入状态事件；token 与上下文保持未知" : "来源未报告有效快照；缺失时不估算百分比" : `${card.context_estimated ? "最近请求的输入量" : "来源报告的最近快照"} · ${time(card.context_at)}${card.context_stale ? " · 快照较旧" : ""}`;
   return `<div class="context-row"><span>上下文</span><strong>${esc(label)}</strong></div><div class="context-track ${pct == null ? "unavailable" : ""}"><div class="context-fill" data-width="${pct == null ? 0 : Math.max(0,Math.min(100,pct))}"></div></div><div class="context-note">${esc(note)}</div>`;
 }
 function childrenSummary(card) {
+  if (card.tool === "cursor") return '<div class="card-children"><span>子 Agent 暂未接入</span><span>覆盖未知</span></div>';
   const summary = card.children_summary;
   if (!summary) return `<button type="button" class="card-children" data-detail="${esc(card.id)}"><span>查看子 Agent</span><span>↗</span></button>`;
   const attention = (summary.waiting || 0) + (summary.error || 0);
@@ -138,14 +141,16 @@ function renderSubscriptions(data) {
     const windows = platform.limits.map(limit => {
       const expired = limit.status === "expired";
       const stale = limit.status === "stale";
-      const value = limit.remaining == null ? "—" : limit.unit === "percent" ? `${fmt(limit.remaining)}%` : `${fmt(limit.remaining)} 积分`;
-      const reset = limit.resets_at ? `重置 ${dateTime(limit.resets_at)}` : "重置时间未报告";
+      const approximate = limit.display_precision === "integer_percent" ? "约 " : "";
+      const value = limit.remaining == null ? "—" : limit.unit === "percent" ? `${approximate}${fmt(limit.remaining)}%` : `${fmt(limit.remaining)} 积分`;
+      const reset = limit.resets_at ? `重置 ${dateTime(limit.resets_at)}` : limit.reset_label ? `重置日期 ${limit.reset_label}（日精度）` : "重置时间未报告";
       const detail = limit.unit === "credits" ? `已用 ${fmt(limit.used)} / 合计 ${fmt(limit.limit)}` : `${expired || stale ? "上次已用" : "已用"} ${fmt(limit.used)}%`;
-      const caption = expired ? "已到重置时间，等待新快照" : stale ? "上次报告的剩余量" : "剩余";
-      return `<div class="quota-window"><div class="quota-window-title"><span>${esc(limit.label)}</span>${limit.bucket !== platform.tool ? `<small>${esc(limit.bucket)}</small>` : ""}</div><div class="quota-value ${expired || stale ? "old" : (limit.remaining_percent != null && limit.remaining_percent <= 10 ? "low" : "")}"><strong>${esc(value)}</strong><span>${esc(caption)}</span></div><div class="quota-track"><i data-quota-width="${expired || limit.remaining_percent == null ? 0 : Math.max(0,Math.min(100,limit.remaining_percent))}"></i></div><div class="quota-detail">${esc(detail)} · ${esc(reset)}</div></div>`;
+      const caption = expired ? (limit.source === "cursor_dashboard_ui" ? "可能已重置，等待重新读取" : "已到重置时间，等待新快照") : stale ? "上次报告的剩余量" : limit.source === "cursor_dashboard_ui" ? "页面快照剩余" : "剩余";
+      return `<div class="quota-window"><div class="quota-window-title"><span>${esc(limit.label)}</span>${limit.bucket !== platform.tool && platform.tool !== "cursor" ? `<small>${esc(limit.bucket)}</small>` : ""}</div><div class="quota-value ${expired || stale ? "old" : (limit.remaining_percent != null && limit.remaining_percent <= 10 ? "low" : "")}"><strong>${esc(value)}</strong><span>${esc(caption)}</span></div><div class="quota-track"><i data-quota-width="${expired || limit.remaining_percent == null ? 0 : Math.max(0,Math.min(100,limit.remaining_percent))}"></i></div><div class="quota-detail">${esc(detail)} · ${esc(reset)}</div></div>`;
     }).join("");
-    const action = platform.tool === "claude" && !platform.limits.length ? '<button class="quota-setup" data-quota-setup="claude">设置状态栏上报 ↗</button>' : "";
-    return `<article class="quota-card"><div class="quota-heading">${toolIcon(platform.tool)}<h3>${esc(platform.name)}</h3><span class="quota-status ${esc(platform.status)}">${esc(data.demo ? "人工样例" : statusNames[platform.status] || "未获取")}</span></div>${windows || '<div class="quota-empty"><strong>—</strong><span>尚未取得订阅剩余量</span></div>'}<p class="quota-notice">${esc(platform.notice)}</p>${action}<div class="quota-updated">${platform.updated_at ? `来源更新 ${dateTime(platform.updated_at)}` : "等待来源数据"}${platform.refreshing ? " · 正在更新" : ""}</div></article>`;
+    const action = platform.tool === "claude" && !platform.limits.length ? '<button class="quota-setup" data-quota-setup="claude">设置状态栏上报 ↗</button>' : platform.tool === "cursor" ? '<a class="quota-setup" href="https://cursor.com/dashboard/spending" target="_blank" rel="noopener noreferrer">官网核对额度 ↗</a>' : "";
+    const sourceTime = platform.captured_at ? `页面读取 ${dateTime(platform.captured_at)} · 官方更新时间未提供` : platform.updated_at ? `来源更新 ${dateTime(platform.updated_at)}` : "等待来源数据";
+    return `<article class="quota-card"><div class="quota-heading">${toolIcon(platform.tool)}<h3>${esc(platform.name)}</h3><span class="quota-status ${esc(platform.status)}">${esc(data.demo ? "人工样例" : statusNames[platform.status] || "未获取")}</span></div>${windows || '<div class="quota-empty"><strong>—</strong><span>尚未取得订阅剩余量</span></div>'}<p class="quota-notice">${esc(platform.notice)}</p>${action}<div class="quota-updated">${esc(sourceTime)}${platform.refreshing ? " · 正在更新" : ""}</div></article>`;
   }).join("");
   document.querySelectorAll("[data-quota-width]").forEach(el => el.style.width = `${el.dataset.quotaWidth}%`);
 }
@@ -280,6 +285,7 @@ async function loadHistory() {
 
 async function loadSettings() {
   const data = await api("/api/integrations");
+  state.integrations = data;
   updateToolOptions(data.sources.map(source => source.tool));
   $("#demo-banner").hidden = !data.demo;
   $("#enable-claude").disabled = Boolean(data.demo);
@@ -289,7 +295,8 @@ async function loadSettings() {
     const config = data.lifecycles?.[source.tool];
     const status = config?.error || (config?.complete ? config.last_hook_at ? "已配置 · 已收到上报" : "已配置 · 等待首次上报" : config?.enabled ? "部分事件已配置" : "状态增强尚未配置");
     const lifecycle = config ? `<div class="source-precision">${esc(status)}<br>最近状态上报：${esc(dateTime(config.last_hook_at))}${source.tool === "codex" && config.enabled && !config.last_hook_at ? "<br>首次上报前，请确认已在 Codex CLI 的 /hooks 中审阅并信任新增项。" : ""}</div><div class="enhance-actions"><button class="button secondary" data-lifecycle-enable="${esc(source.tool)}" ${data.demo ? "disabled" : ""}>预览状态接入</button>${config.enabled ? `<button class="button secondary" data-lifecycle-restore="${esc(source.tool)}" ${data.demo ? "disabled" : ""}>撤销状态接入</button>` : ""}</div>` : "";
-    return `<div class="source-panel"><div class="source-heading">${toolIcon(source.tool,true)}<h3>${esc(source.name)}</h3><span class="status-chip ${source.present ? "idle" : "unknown"}">${source.present ? "发现本地目录" : "尚未发现"}</span></div><p>${esc(source.label)}</p><div class="source-precision">${esc(source.precision)}</div>${lifecycle}</div>`;
+    const boundary = source.tool === "cursor" ? '<p class="source-boundary">状态 hooks 不提供 token、上下文或订阅额度。额度可独立保存官网页面快照，不会自动刷新；等待回复和系统审批覆盖尚未确认，跳转只打开 Cursor 应用。</p>' : "";
+    return `<div class="source-panel"><div class="source-heading">${toolIcon(source.tool,true)}<h3>${esc(source.name || toolName(source.tool))}</h3><span class="status-chip ${source.present ? "idle" : "unknown"}">${source.present ? "发现本地目录" : "尚未发现"}</span></div><p>${esc(source.label)}</p><div class="source-precision">${esc(source.precision)}</div>${boundary}${lifecycle}</div>`;
   }).join("");
   const config = data.claude;
   $("#enhance-status").textContent = config.error || (config.complete ? data.last_hook_at ? "已配置 · 已收到上报" : "已配置 · 等待实际状态上报" : config.enabled ? "部分事件已配置" : "可选增强 · 尚未启用");
@@ -327,6 +334,7 @@ function modal(title,html,actions=[]) {
 }
 function closeModal() { stopDetails(); $("#modal").close(); }
 async function jumpTo(id,kind) {
+  if (state.snapshot?.demo || state.integrations?.demo) { toast("演示模式不打开真实应用"); return; }
   try { const result = await api("/api/jump",{id,...(kind ? {kind} : {})}); toast(result.message || "已发起跳转，请查看对应应用"); }
   catch (error) { toast(error.message); }
 }
@@ -334,8 +342,9 @@ function sourceLabel(card) {
   return ({hook:`${toolName(card.tool)} 状态上报`,process:"进程观测",event:"客户端状态事件",record:"本地事件记录",demo:"人工演示事件"})[card.state_source] || card.state_source || "未知";
 }
 function detailMarkup(card) {
-  const entries = [["会话 ID",card.source_id],["所属项目",card.project_name],["工作目录",card.working_directory || card.worktree_name || "未识别"],["角色",roles[card.role] || "关系未知"],["父会话",card.parent_id || "—"],["客户端版本",card.version || "未知"],["最近状态",`${labels[card.state] || card.state || "待确认"} · ${dateTime(card.state_at)}`],["状态依据",sourceLabel(card)],["进程状态",({online:"进程在线",offline:"进程已退出",unknown:"进程待匹配"})[card.liveness] || "进程待匹配"],["跳转精度",card.jump.precision || "未知"],["采集覆盖",({observed:"已观测记录",status_only:"仅状态上报 · 未发现会话记录",partial_baseline:"缺少早期用量基线",counter_reset:"来源累计计数曾重置",partial_usage:"部分用量字段缺失",partial_records:"部分记录无法读取",missing_time:"部分记录缺少时间",missing_request_id:"部分用量缺少请求身份"})[card.coverage] || card.coverage || "未知"],["今日 token",fmt(card.usage.today)],["已采集累计 token",fmt(card.usage.observed_total)]];
-  return `<div class="detail-grid">${entries.map(([label,value]) => `<div><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}</div><p class="detail-note">${card.stale ? "当前状态来自较早的事件，请跳回原工具确认。" : "在线表示匹配到进程，未确认执行的会话保持待确认。"} 用量只覆盖可读取的来源；看板不会猜测缺失数据。${!card.jump.available && card.jump.reason ? " " + esc(card.jump.reason) : ""}</p>`;
+  const coverage = card.coverage === "status_only" && card.tool === "cursor" ? "仅状态上报 · 未接入用量" : ({observed:"已观测记录",status_only:"仅状态上报 · 未发现会话记录",partial_baseline:"缺少早期用量基线",counter_reset:"来源累计计数曾重置",partial_usage:"部分用量字段缺失",partial_records:"部分记录无法读取",missing_time:"部分记录缺少时间",missing_request_id:"部分用量缺少请求身份"})[card.coverage] || card.coverage || "未知";
+  const entries = [["会话 ID",card.source_id],["所属项目",card.project_name],["工作目录",card.working_directory || card.worktree_name || "未识别"],["角色",roles[card.role] || "关系未知"],["父会话",card.parent_id || "—"],["客户端版本",card.version || "未知"],["最近状态",`${labels[card.state] || card.state || "待确认"} · ${dateTime(card.state_at)}`],["状态依据",sourceLabel(card)],["进程状态",({online:"进程在线",offline:"进程已退出",unknown:"进程待匹配"})[card.liveness] || "进程待匹配"],["跳转精度",card.jump.precision || "未知"],["采集覆盖",coverage],["今日 token",fmt(card.usage.today)],["已采集累计 token",fmt(card.usage.observed_total)]];
+  return `<div class="detail-grid">${entries.map(([label,value]) => `<div><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}</div><p class="detail-note">${card.stale ? "当前状态来自较早的事件，请跳回原工具确认。" : "在线表示匹配到进程，未确认执行的会话保持待确认。"} 用量只覆盖可读取的来源；看板不会猜测缺失数据。${card.tool === "cursor" ? " Cursor 当前仅上报状态；等待回复和系统审批覆盖尚未确认，打开应用不代表定位或看过指定会话。" : ""}${!card.jump.available && card.jump.reason ? " " + esc(card.jump.reason) : ""}</p>`;
 }
 function selectDetail(card) {
   const detail = state.detail;
@@ -377,6 +386,13 @@ function renderChildren(data) {
 async function loadChildren(force=false) {
   const detail = state.detail;
   if (!detail || !$("#modal").open || (detail.loading && !force)) return;
+  if (detail.parent?.tool === "cursor") {
+    detail.children = [];
+    $("#children-summary").textContent = "覆盖未知";
+    $("#children-list").innerHTML = '<div class="children-empty">Cursor 子 Agent 暂未接入，无法确认其数量与状态。</div>';
+    $("#children-note").textContent = "当前仅观察主会话状态；未取得子 Agent 数据不代表没有子 Agent。";
+    return;
+  }
   detail.controller?.abort();
   const controller = new AbortController();
   detail.controller = controller;
@@ -456,14 +472,16 @@ function restoreClaude() {
 }
 
 async function previewLifecycle(tool) {
+  if (state.snapshot?.demo || state.integrations?.demo) { toast("演示模式不修改真实接入配置"); return; }
   const preview = await api(`/api/${tool}/preview`,{});
-  const sample = {hooks:{PermissionRequest:[{hooks:[{type:"command",command:preview.command,timeout:3,async:false}]}]}};
+  const sample = preview.configuration || (tool === "cursor" ? {events:preview.events,command:preview.command} : {hooks:{PermissionRequest:[{hooks:[{type:"command",command:preview.command,timeout:3,async:false}]}]}});
   modal(`预览 ${toolName(tool)} 状态接入`,`<p>${esc(preview.effect)}</p><div class="detail-note">${esc(preview.privacy)}</div><div class="event-tags">${preview.events.map(e => `<span>${esc(e)}</span>`).join("")}</div><p>写入 ${esc(preview.settings_label)}，保留已有 hooks，并在本机备份。</p><pre>${esc(JSON.stringify(sample,null,2))}</pre><p class="detail-note">${esc(preview.next_step)}</p>`,[
     {label:"保存状态接入",primary:true,run:async () => { await api(`/api/${tool}/enable`,{hash:preview.hash}); closeModal(); await loadSettings(); toast(preview.next_step); }},
     {label:"取消",run:closeModal}
   ]);
 }
 function restoreLifecycle(tool) {
+  if (state.snapshot?.demo || state.integrations?.demo) { toast("演示模式不修改真实接入配置"); return; }
   modal(`撤销 ${toolName(tool)} 状态接入`,"<p>移除 AgentWatch 添加的状态 hooks，保留其他设置、历史用量和本机备份。</p>",[
     {label:"确认撤销",primary:true,run:async () => { await api(`/api/${tool}/restore`,{}); closeModal(); await loadSettings(); toast("状态接入配置已撤销"); }},
     {label:"取消",run:closeModal}

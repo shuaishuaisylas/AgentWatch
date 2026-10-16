@@ -21,3 +21,7 @@ config-backups/
 /本机Agent看板_*.md
 /验证记录_*.md
 
+
+# Native desktop client build products and local preferences.
+desktop/.build/
+desktop/.swiftpm/
