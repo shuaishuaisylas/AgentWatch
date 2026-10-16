@@ -49,7 +49,7 @@ class DemoTests(unittest.TestCase):
     def test_all_source_roots_and_database_are_temporary_and_no_real_collector_runs(self):
         collector = self.demo.collector
         for path in [collector.codex_home, collector.claude_home, collector.desktop_home,
-                     collector.workbuddy_home, self.demo.store.path]:
+                     collector.workbuddy_home, collector.cursor_home, self.demo.store.path]:
             self.assertTrue(path.is_relative_to(self.demo.root))
             self.assertTrue(path.exists())
         with patch("agentwatch.collector.process_inventory", side_effect=AssertionError("real processes")), \
@@ -71,7 +71,7 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(snapshot["demo"])
         cards = snapshot["sessions"]
-        self.assertEqual({card["tool"] for card in cards}, {"codex", "claude", "workbuddy"})
+        self.assertEqual({card["tool"] for card in cards}, {"codex", "claude", "workbuddy", "cursor"})
         self.assertEqual({card["role"] for card in cards}, {"main", "child", "unknown"})
         self.assertEqual({card["state"] for card in cards},
                          {"active", "waiting_user", "waiting_approval", "error", "idle", "unknown"})
@@ -116,7 +116,7 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(cards["codex:demo-copy"]["liveness"], "offline")
         self.assertEqual(cards["codex:demo-offline"]["state"], "active")
         self.assertEqual(cards["codex:demo-offline"]["liveness"], "offline")
-        self.assertEqual(snapshot["counts"]["active"], 3)
+        self.assertEqual(snapshot["counts"]["active"], 4)
         self.assertTrue(all(card["parent_id"] is None for card in cards.values() if card["role"] == "unknown"))
         self.assertFalse(any(card["parent_id"] == "codex:demo-complete" for card in cards.values()))
         for sid in ["codex:demo-implementation", "codex:demo-audit", "codex:demo-copy",
@@ -149,7 +149,8 @@ class DemoTests(unittest.TestCase):
              patch("agentwatch.configuration.ClaudeConfiguration.install", side_effect=AssertionError("real settings")):
             for path in ["/api/jump", "/api/claude/preview", "/api/claude/enable", "/api/claude/restore",
                          "/api/codex/preview", "/api/codex/enable", "/api/codex/restore",
-                         "/api/workbuddy/preview", "/api/workbuddy/enable", "/api/workbuddy/restore"]:
+                         "/api/workbuddy/preview", "/api/workbuddy/enable", "/api/workbuddy/restore",
+                         "/api/cursor/preview", "/api/cursor/enable", "/api/cursor/restore", "/api/cursor/subscription"]:
                 status, payload = self.dispatch(path, {"id": "codex:demo-design", "kind": "codex"})
                 self.assertEqual(status, 403)
                 self.assertTrue(payload["demo"])
@@ -167,8 +168,10 @@ class DemoTests(unittest.TestCase):
         status, payload = self.dispatch("/api/subscriptions?tool=workbuddy&role=main&project=unrelated")
         self.assertEqual(status, 200)
         self.assertTrue(payload["demo"])
-        self.assertEqual({p["tool"] for p in payload["platforms"]}, {"codex", "claude", "workbuddy"})
-        self.assertTrue(all(p["limits"] for p in payload["platforms"]))
+        self.assertEqual({p["tool"] for p in payload["platforms"]}, {"codex", "claude", "workbuddy", "cursor"})
+        self.assertTrue(all(p["limits"] for p in payload["platforms"] if p["tool"] != "cursor"))
+        cursor = next(p for p in payload["platforms"] if p["tool"] == "cursor")
+        self.assertEqual((cursor["status"], cursor["limits"]), ("unavailable", []))
 
 
 class DemoLifecycleTests(unittest.TestCase):
@@ -194,7 +197,7 @@ class DemoLifecycleTests(unittest.TestCase):
             forbidden = Path(directory) / "must-not-create"
             argv = ["agentwatch", "--demo", "--port", "8767", "--open", "--data-dir", str(forbidden),
                     "--codex-home", str(forbidden), "--claude-home", str(forbidden),
-                    "--desktop-home", str(forbidden), "--workbuddy-home", str(forbidden)]
+                    "--desktop-home", str(forbidden), "--workbuddy-home", str(forbidden), "--cursor-home", str(forbidden)]
             with patch("sys.argv", argv), patch.object(entrypoint, "AppServer", FakeServer), \
                  patch.object(entrypoint, "Collector", side_effect=AssertionError("production collector")), \
                  patch.object(entrypoint, "ClaudeConfiguration", side_effect=AssertionError("production config")), \
@@ -204,7 +207,7 @@ class DemoLifecycleTests(unittest.TestCase):
                 self.assertEqual(entrypoint.main(), 0)
             self.assertFalse(forbidden.exists())
         self.assertEqual(observed["port"], 8767)
-        self.assertEqual(observed["tools"], {"codex", "claude", "workbuddy"})
+        self.assertEqual(observed["tools"], {"codex", "claude", "workbuddy", "cursor"})
         self.assertTrue(observed["closed"])
         self.assertFalse(observed["root"].exists())
         timer.assert_called_once()

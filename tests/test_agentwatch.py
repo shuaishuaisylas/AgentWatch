@@ -35,11 +35,12 @@ class Fixture(unittest.TestCase):
         self.claude = self.root / "claude"
         self.desktop = self.root / "desktop"
         self.workbuddy = self.root / "workbuddy"
-        for path in [self.data,self.codex,self.claude,self.desktop,self.workbuddy]:
+        self.cursor = self.root / "cursor"
+        for path in [self.data,self.codex,self.claude,self.desktop,self.workbuddy,self.cursor]:
             path.mkdir()
         self.store = Store(self.data / "watch.sqlite")
         self.parser = RecordParser(self.store)
-        self.collector = Collector(self.store,self.codex,self.claude,self.data,self.desktop,workbuddy_home=self.workbuddy)
+        self.collector = Collector(self.store,self.codex,self.claude,self.data,self.desktop,workbuddy_home=self.workbuddy,cursor_home=self.cursor)
 
     def tearDown(self):
         self.store.close()
@@ -620,6 +621,72 @@ class HttpTests(Fixture):
         response = conn.getresponse(); result = (response.status,dict(response.getheaders()),response.read())
         conn.close(); return result
 
+    def test_cursor_routes_preview_preserve_race_check_enable_restore_and_no_auto_read(self):
+        from agentwatch.cursor_bridge import sanitize as cursor_sanitize
+        _, headers, html = self.request("/")
+        csrf = re.search(b'name="csrf" content="([^"]+)"', html)[1].decode()
+        cookie = headers["Set-Cookie"].split(";")[0]
+        auth = {"Cookie": cookie, "Content-Type": "application/json", "X-AgentWatch-CSRF": csrf}
+        settings = self.cursor / "hooks.json"
+        self.assertEqual(self.request("/api/cursor/preview", "POST", {})[0], 401)
+        self.assertEqual(self.request("/api/cursor/enable", "POST", {}, Cookie=cookie)[0], 403)
+        status, _, body = self.request("/api/cursor/preview", "POST", {}, **auth)
+        preview = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertFalse(settings.exists())
+        self.assertEqual(preview["configuration"]["version"], 1)
+        existing = {"version": 1, "hooks": {"stop": [{"command": "echo synthetic-third-party"}]}}
+        settings.write_text(json.dumps(existing))
+        self.assertEqual(self.request("/api/cursor/enable", "POST", {"hash": preview["hash"]}, **auth)[0], 409)
+        _, _, body = self.request("/api/cursor/preview", "POST", {}, **auth)
+        status, _, body = self.request("/api/cursor/enable", "POST", {"hash": json.loads(body)["hash"]}, **auth)
+        self.assertEqual((status, json.loads(body)["complete"]), (200, True))
+        _, _, body = self.request("/api/integrations", Cookie=cookie)
+        integrations = json.loads(body)
+        self.assertTrue(integrations["lifecycles"]["cursor"]["complete"])
+        self.assertIsNone(integrations["lifecycles"]["cursor"]["last_hook_at"])
+        self.assertTrue(next(p for p in integrations["sources"] if p["tool"] == "cursor")["present"])
+        with self.store.lock, self.store.db:
+            self.parser.lifecycle(cursor_sanitize({"hook_event_name": "stop", "conversation_id": "synthetic-cursor",
+                                  "generation_id": "synthetic-generation", "status": "completed"}), {})
+        with patch("agentwatch.server.jump", return_value={"opened": True, "kind": "cursor", "message": "test"}) as mocked:
+            self.assertEqual(self.request("/api/jump", "POST", {"id": "cursor:synthetic-cursor", "kind": "claude"}, **auth)[0], 400)
+            self.assertEqual(self.request("/api/jump", "POST", {"id": "cursor:synthetic-cursor"}, **auth)[0], 200)
+            self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM completion_receipts").fetchone()[0], 0)
+        status, _, body = self.request("/api/cursor/restore", "POST", {}, **auth)
+        self.assertEqual((status, json.loads(body)["removed"]), (200, 8))
+        self.assertEqual(json.loads(settings.read_text()), existing)
+
+    def test_cursor_observation_import_requires_auth_and_preserves_snapshot_on_bad_input(self):
+        import time
+        _, headers, html = self.request("/")
+        csrf = re.search(b'name="csrf" content="([^"]+)"', html)[1].decode()
+        cookie = headers["Set-Cookie"].split(";")[0]
+        auth = {"Cookie": cookie, "Content-Type": "application/json", "X-AgentWatch-CSRF": csrf}
+        raw = {"captured_at": time.time(), "limits": [
+            {"key": "cursor_models", "used_percent": 38, "period": "monthly", "reset_on": None, "reset_label": None},
+            {"key": "other_models", "used_percent": 100, "period": "monthly", "reset_on": None, "reset_label": None}]}
+        path = "/api/cursor/subscription"
+        self.assertEqual(self.request(path, "POST", raw)[0], 401)
+        self.assertEqual(self.request(path, "POST", raw, Cookie=cookie)[0], 403)
+        self.assertEqual(self.request(path, "POST", raw, **dict(auth, Origin="https://external.invalid"))[0], 403)
+        status, _, response = self.request(path, "POST", raw, **auth)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(response)["recorded"])
+        _, _, response = self.request("/api/subscriptions", Cookie=cookie)
+        platform = next(p for p in json.loads(response)["platforms"] if p["tool"] == "cursor")
+        self.assertIsNone(platform["updated_at"])
+        self.assertEqual(platform["captured_at"], raw["captured_at"])
+        self.assertEqual([p["remaining"] for p in platform["limits"]], [62, 0])
+        self.assertTrue(all(p["source"] == "cursor_dashboard_ui" for p in platform["limits"]))
+        invalid = dict(raw, captured_at=raw["captured_at"] + 1, credential=SECRET)
+        self.assertEqual(self.request(path, "POST", invalid, **auth)[0], 400)
+        self.assertNotIn(SECRET, "\n".join(self.store.db.iterdump()))
+        _, _, response = self.request("/api/subscriptions", Cookie=cookie)
+        retained = next(p for p in json.loads(response)["platforms"] if p["tool"] == "cursor")
+        self.assertEqual(retained, platform)
+
     def test_cookie_csrf_host_and_origin_boundaries(self):
         status,headers,html = self.request("/")
         self.assertEqual(status,200)
@@ -629,7 +696,7 @@ class HttpTests(Fixture):
         self.assertEqual(self.request("/api/subscriptions")[0],401)
         quota_status,_,quota_body = self.request("/api/subscriptions",Cookie=cookie)
         self.assertEqual(quota_status,200)
-        self.assertEqual(len(json.loads(quota_body)["platforms"]),3)
+        self.assertEqual(len(json.loads(quota_body)["platforms"]),4)
         self.assertEqual(self.request("/api/snapshot",Cookie=cookie)[0],200)
         self.assertEqual(self.request("/api/rescan","POST",{},Cookie=cookie)[0],403)
         self.assertEqual(self.request("/api/rescan","POST",{},Cookie=cookie,**{"X-AgentWatch-CSRF":csrf})[0],200)

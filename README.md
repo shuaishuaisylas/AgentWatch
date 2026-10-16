@@ -1,6 +1,6 @@
 # AgentWatch
 
-本机运行的 Codex / Claude Code / WorkBuddy 会话看板。第一版是 Web 应用，数据只留在这台 Mac；后续可在同一采集层上增加桌面顶部灵动岛。
+本机运行的 Codex / Claude Code / WorkBuddy / Cursor 会话看板。Cursor 提供可观测状态事件；订阅额度可独立保存官网页面读数，token 仍保持未知。数据只留在这台 Mac，提供 Web 看板和桌面胶囊。
 
 ## 拉取后开始
 
@@ -16,7 +16,7 @@ python3 -m agentwatch --demo --port 8767 --open
 
 前端与后端由同一个 Python 服务提供。不要直接双击 `web/index.html`，也不要另起静态服务器或 Vite 来连接本地 API；页面需要同源 cookie 和 CSRF 校验。修改 `web/` 后刷新页面即可。Node.js 仅用于可选的 JavaScript 语法检查，不是运行依赖。
 
-协作前按顺序阅读 [AGENTS.md](AGENTS.md)、[交接说明](docs/HANDOFF.md)、[API 约定](docs/API.md)。后端主要在 `agentwatch/`，前端主要在 `web/`；交接说明包含可直接交给开发 Agent 的开工指令。
+共同开发以 `main` 为基线，本批胶囊与 Cursor 功能通过 [PR #2](https://github.com/shuaishuaisylas/AgentWatch/pull/2) 合入；合并记录与状态以该 PR 为准，不依赖旧交接中的功能分支或提交号。协作前按顺序阅读 [AGENTS.md](AGENTS.md)、[交接说明](docs/HANDOFF.md)、[API 约定](docs/API.md)。[协作指南](docs/CONTRIBUTING.md) 提供从 `origin/main` 创建独立 `codex/<task>` 分支、验收和可直接交给开发 Agent 的开工指令。后端主要在 `agentwatch/`，Web 前端在 `web/`，macOS 胶囊在 `desktop/`。
 
 ## 使用真实本机数据
 
@@ -30,6 +30,17 @@ python3 -m agentwatch --open
 
 看板读取的是运行者这台 Mac 的记录，无需共享账号、API Key 或原始会话。未安装相应工具或没有本地记录时仍可启动，只会显示空态；这不等于接入故障。端口被占用时，可以指定 `--port 8768`。第二次启动前先检查原服务是否还在运行。
 
+## 桌面胶囊
+
+macOS 原生客户端位于 `desktop/`，复用同一本机 API，不依赖浏览器常驻。需要带 Swift 的 Command Line Tools / Xcode；仓库只提供源码，不包含构建产物。先退出已有胶囊，再运行：
+
+```sh
+# 人工演示：构建并启动隔离服务，不连接真实来源
+./desktop/scripts/run-demo.sh
+```
+
+真实模式先启动看板服务，再双击 `启动胶囊.command`。仅大于零的“执行”和“待处理”会显示；无任务时文字留空，胶囊与额度描边仍保持可见、可点击，方便调试和查看详情。可通过菜单手动暂隐，手动暂隐仍优先。详情支持可靠完成的已读确认与人工提醒的本地消除；不替用户回复或批准。更多操作及安全重启见 [桌面说明](desktop/README.md)，当前实现与验收边界见 [桌面交接](docs/DESKTOP_CAPSULE_CURRENT_HANDOFF.md)。
+
 ## 第一版能做什么
 
 - 自动读取可发现的 Codex 本地会话索引、记录，以及 Claude Code、WorkBuddy 记录。保留原来的启动方式。
@@ -38,6 +49,7 @@ python3 -m agentwatch --open
 - 历史统计改为北京时间当前自然年的每日 token 热力图，工具筛选默认“合计”。没有记录的日期显示未知，已报告的零值保留为 0，未来日期单独标注。年度合计包含所有角色，缓存和推理分项不重复相加；不因主卡片只显示主会话而丢失子 Agent 用量。旧日/周/月/年统计 API 保留兼容。
 - 今日状态动态自动过期；长期保存会话元数据和数字统计。配置增强产生的临时事件文件在被采集后清空。
 - 可在详情中给会话设置名称。读取 Claude 的显式自定义名称；不使用提示词或生成摘要作为标题。
+- Cursor 需用户启用状态 hooks 后发现会话；首版只提供可观测状态，不读取其聊天数据库或推算用量，具体范围见下文。
 
 ## Codex / WorkBuddy 状态上报
 
@@ -52,6 +64,18 @@ WorkBuddy 启用后新开会话，发送普通问题并检查实际状态切换�
 WorkBuddy 的桌面安全沙箱审批可能不触发 `PermissionRequest` hook。看板还会自动只读 `logs/<日期>/sdk/conversations/*.log` 中格式明确的状态机转换，补充沙箱审批、允许后继续执行和本轮空闲；其余诊断正文直接跳过，不进入数据库、游标或页面。提问工具的确认卡片按等待回复处理，不能仅因按钮写着“批准”就当作系统权限审批。该通道已在 WorkBuddy 5.8.2 实测；未来版本未识别的格式保持忽略，不能推测状态。
 
 依据：[Codex 官方 hooks 与信任要求](https://learn.chatgpt.com/docs/hooks)、[WorkBuddy 插件与 hooks](https://www.codebuddy.cn/docs/workbuddy/Plugins)、[CodeBuddy hooks](https://www.codebuddy.cn/docs/cli/hooks)。
+
+## Cursor 状态接入
+
+在 **接入设置 → Cursor → 预览状态接入** 查看将新增的 hooks，确认后保存。配置合并到 Cursor 用户目录的 `hooks.json`，默认目录为 `~/.cursor`，自定义位置可通过 `--cursor-home` 指定。保存前备份并校验文件是否变化；撤销只移除 AgentWatch 添加的项。启用后新开或继续 Cursor Agent 会话，查看“最近状态上报”和实际状态变化。设置已保存不等于客户端已加载或真实事件已触发；演示模式禁止修改真实配置和打开真实应用。
+
+首版只采集身份、时间、工作目录及明确事件等最少状态元数据，不保存提示词、思考正文、工具参数或结果。`beforeSubmitPrompt` 只表示请求已提交，仍待确认执行；`postToolUse`、`afterAgentThought`、`preCompact` 等明确执行事件可用于确认执行中。只有 `stop` 明确报告 `completed` 才记录本轮结束，不能据此宣称业务目标成功；事件陈旧后仍按统一规则降为待确认。
+
+**等待回复、系统审批、子 Agent、token 和上下文尚未接入。** 当前会话标记为 `status_only`，缺失数字显示“—”，不会把事件次数换算成用量。人工待处理覆盖保持未知；待处理计数不证明 Cursor 当前无人需要处理，本轮结束也不会据此自动生成完成收件箱提醒。打开按钮仅打开 Cursor 应用，不保证定位原会话，也不会自动标记该会话已看过。
+
+订阅额度可从已登录的 [Cursor 官方 Spending 页面](https://cursor.com/dashboard/spending) 读取并显式保存为本机页面快照。它与状态 hooks、会话 token 独立，不读取私有登录凭据，也不是个人余额自动查询 API。只保存服务端允许的额度池、百分比、周期、日期和读取时间；不保存账号或页面正文。官网整数百分比标为“约”，官方更新时间未知时保持 null，另显示页面读取时间。月度池、周池和 Grok Bot 分开，不能相加；不从美元消耗反算余额。超过 15 分钟标旧快照，进入可能重置日期后保守显示未知，不自动补满。看板“更新额度”不会自动重新读取 Cursor 网站，请通过“官网核对额度”检查后重新读取；接口见 `docs/API.md`。
+
+该实现提供首版可观测状态覆盖，仍须在用户实际使用的 Cursor 版本与入口分别验收；配置合并测试和人工演示不能代替真实客户端验证。
 
 ## Claude Code 增强
 
@@ -80,6 +104,7 @@ WorkBuddy 的桌面安全沙箱审批可能不触发 `PermissionRequest` hook。
 | Codex | 本地 `token_count.rate_limits` 快照 | 按实际 `window_minutes` 区分周额度、5 小时等窗口；不把 primary 固定当作 5 小时。不额外启动 Agent 或调用模型 API |
 | Claude Code | 官方 statusLine 的 `rate_limits` | 在接入设置勾选“同时上报终端上下文和订阅额度”，预览并启用，然后由新的 Pro/Max 会话完成一次回复；5 小时与每周窗口可分别缺失 |
 | WorkBuddy | 官方 `GET /openapi/v2/credit` | 需要具有 `user.credit.readable` 的官方 OAuth access token；返回资源包总额和已用积分，无法拆分订阅、充值、赠送，也不返回周重置时间 |
+| Cursor | 官网页面快照（显式读取） | 个人自动额度 API 尚未接入；按池显示页面读数、读取时间与旧值提示，缺失时保持未知 |
 
 WorkBuddy 读取运行环境中的 `AGENTWATCH_WORKBUDDY_ACCESS_TOKEN`。凭证由官方第三方应用授权流程获取，不复用或提取桌面软件的私有凭据。当前未实现应用注册/OAuth 登录界面或自动续期。未配置、授权失败或响应字段缺失时明确显示未知；不从本地累计 token 推算积分。
 
@@ -118,6 +143,7 @@ Codex、Claude 的数字代表最近本机会话报告的账号额度；多账�
 | Claude VS Code | 打开所属项目。暂不调用可能在会话不存在时新建对话的会话链接 |
 | Claude 桌面 Code | 打开 Claude 应用；不保证定位到原会话 |
 | WorkBuddy 桌面 | 打开 WorkBuddy 应用；不保证定位到原会话 |
+| Cursor | 打开 Cursor 应用；不保证定位到原会话，不自动确认已看过 |
 
 跳转只在用户点击时执行，不向 Agent 提交消息、批准任务或启动新的编程任务。未识别入口时按钮不可用。
 
@@ -127,7 +153,7 @@ Codex 需要已采集且仍存在的本地会话文件才启用跳转；只有�
 
 默认数据目录：`~/.local/share/agentwatch`。可用 `--data-dir` 修改。
 
-采集来源默认是 `~/.codex`、`~/.claude`、`~/.workbuddy` 和 Claude 本地 Code 数据目录；可通过 `--codex-home`、`--claude-home`、`--workbuddy-home`、`--desktop-home` 指定，也支持 `CODEX_HOME`、`CLAUDE_CONFIG_DIR` 和 `WORKBUDDY_HOME`。不采集豆包工作、Claude Cowork、普通 Chat 和 DeepSeek Harness。
+采集来源默认是 `~/.codex`、`~/.claude`、`~/.workbuddy`、Cursor 的 `~/.cursor` hooks 目录和 Claude 本地 Code 数据目录；可通过 `--codex-home`、`--claude-home`、`--workbuddy-home`、`--cursor-home`、`--desktop-home` 指定，也支持 `CODEX_HOME`、`CLAUDE_CONFIG_DIR` 和 `WORKBUDDY_HOME`。不采集豆包工作、Claude Cowork、普通 Chat 和 DeepSeek Harness。
 
 解析时仅提取会话标识、项目/工作目录、版本、主子关系、状态和数字用量。提示词、回复、代码、工具参数、工具结果和凭据不进入看板数据库、界面或日志。来源记录与数据库保持只读；用户启用状态增强时才修改对应 hook 配置。为了定位项目、匹配进程及跳转，数据库会保留本机路径、进程 ID / 启动身份和 TTY。
 

@@ -12,8 +12,10 @@ from contextlib import closing
 from pathlib import Path
 
 from .common import fingerprint, now, number, safe_id, short_text, timestamp
+from .codex_names import read_codex_names
 from .subscriptions import backfill_codex, record_claude, record_codex
 from .lifecycle_bridge import EVENTS as LIFECYCLE_EVENTS
+from .cursor_events import collect_cursor
 
 
 def workbuddy_transition(raw, source_id):
@@ -97,6 +99,133 @@ class RecordParser:
     def __init__(self, store):
         self.store = store
 
+    @staticmethod
+    def question_tool(name):
+        if not isinstance(name, str):
+            return None
+        for prefix in ["", "functions.", "functions__"]:
+            for known in ["request_user_input", "request_user_input_async", "AskUserQuestion", "ExitPlanMode"]:
+                if name == prefix + known:
+                    return known
+        return None
+
+    def codex_attention(self, doc, sid):
+        """Whitelist correlation identities only, independently of execution state."""
+        payload = doc.get("payload") if isinstance(doc, dict) else None
+        at = timestamp(doc.get("timestamp")) if isinstance(doc, dict) else None
+        if not sid or not isinstance(payload, dict) or at is None:
+            return
+        if doc.get("type") == "event_msg":
+            if payload.get("type") == "task_complete":
+                self.store.complete(sid, at)
+            return
+        if doc.get("type") != "response_item":
+            return
+        kind = payload.get("type")
+        if kind == "function_call":
+            name, call = self.question_tool(payload.get("name")), safe_id(payload.get("call_id"))
+            if not call:
+                return
+            if not name:
+                if isinstance(payload.get("name"), str) and payload["name"].rsplit(".", 1)[-1].rsplit("__", 1)[-1] in ["request_user_input", "request_user_input_async"]:
+                    self.store.open_interaction(sid, call, 0, "unknown", at, "unsupported_question_namespace", True, "record")
+                return
+            arguments = payload.get("arguments")
+            try:
+                arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+            except (ValueError, TypeError):
+                arguments = None
+            questions = arguments.get("questions") if isinstance(arguments, dict) else None
+            def valid_question(question):
+                return isinstance(question, dict) and (isinstance(question.get("question"), str) or
+                    (name == "request_user_input_async" and isinstance(question.get("title"), str)))
+            if not isinstance(questions, list) or not 0 < len(questions) <= 64 or not all(valid_question(question) for question in questions):
+                self.store.open_interaction(sid, call, 0, "unknown", at, "invalid_question_shape", name.endswith("_async"), "record")
+                return
+            for index in range(len(questions)):
+                self.store.open_interaction(sid, call, index, "unknown" if name.endswith("_async") else "waiting_user", at, name, name.endswith("_async"), "record")
+            self.store.interaction_alias(sid, payload.get("id"), call)
+        elif kind == "function_call_output":
+            call = safe_id(payload.get("call_id"))
+            if not call:
+                return
+            rows = self.store.db.execute("SELECT asynchronous,item_index,tool_name FROM interaction_requests WHERE session_id=? AND call_id=?", (sid, call)).fetchall()
+            if not rows:
+                return
+            output = payload.get("output")
+            try:
+                output = json.loads(output) if isinstance(output, str) else output
+            except (ValueError, TypeError):
+                return
+            if any(row["asynchronous"] for row in rows):
+                if isinstance(output, dict) and output.get("accepted") is True:
+                    for row in rows:
+                        if row["tool_name"] == "request_user_input_async":
+                            self.store.open_interaction(sid, call, row["item_index"], "waiting_user", at, row["tool_name"], True, "record")
+                return  # accepted=true is delivery, not a human answer.
+            answers = output.get("answers") if isinstance(output, dict) else None
+            if isinstance(answers, dict) and len(answers) >= len(rows) and all(isinstance(value, dict) and isinstance(value.get("answers"), list) and value["answers"] and all(isinstance(answer, str) for answer in value["answers"]) for value in answers.values()):
+                self.store.resolve_interaction(sid, call, at)
+        elif kind == "message" and payload.get("role") == "user":
+            content = payload.get("content")
+            if not isinstance(content, list) or len(content) != 1:
+                return
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") not in ["text", "input_text"] or not isinstance(part.get("text"), str):
+                    continue
+                wrapper = re.fullmatch(r"\s*<send_user_message_question_reply>\s*(.*?)\s*</send_user_message_question_reply>\s*", part["text"], re.DOTALL)
+                for wrapped in [wrapper.group(1)] if wrapper else []:
+                    try:
+                        items = json.loads(wrapped)
+                    except (ValueError, TypeError):
+                        continue
+                    items = [items] if isinstance(items, dict) else items
+                    if not isinstance(items, list):
+                        continue
+                    for item in items:
+                        try:
+                            identity = json.loads(item.get("questionItemId")) if isinstance(item, dict) else None
+                        except (ValueError, TypeError):
+                            continue
+                        if not all(isinstance(item.get(key), str) for key in ["questionItemId", "question", "answer"]):
+                            continue
+                        if not isinstance(identity, list) or len(identity) != 3:
+                            continue
+                        name, call, index = identity
+                        if name == "request_user_input_async":
+                            self.store.resolve_interaction(sid, call, at, item_index=index, tool_name=name)
+
+    def lifecycle_attention(self, sid, doc, at, superseded=False):
+        if superseded:
+            return
+        event = doc.get("event")
+        name = self.question_tool(doc.get("tool_name"))
+        call = safe_id(doc.get("tool_use_id"))
+        if event in ["PreToolUse", "PermissionRequest"] and name:
+            if call:
+                self.store.open_interaction(sid, call, 0, "unknown" if name.endswith("_async") else "waiting_user", at, name, name.endswith("_async"), "hook")
+            else:
+                self.store.open_interaction(sid, "unidentified-question", 0, "unknown", at, name, name.endswith("_async"), "hook")
+        elif event == "PermissionRequest":
+            # Hooks run before reviewer decisions; automatic review is not human work.
+            self.store.open_interaction(sid, call or "unidentified-approval", 0, "unknown", at, "", False, "hook")
+        elif event == "Notification" and doc.get("notification_type") in ["permission_prompt", "agent_needs_input", "elicitation_dialog"]:
+            notification = doc["notification_type"]
+            kind = "waiting_approval" if notification == "permission_prompt" and not name else "waiting_user"
+            if not call:
+                waiting = self.store.db.execute("SELECT DISTINCT call_id FROM interaction_requests WHERE session_id=? AND resolved_at IS NULL AND kind='unknown' AND asynchronous=0 AND tool_name=''", (sid,)).fetchall()
+                if len(waiting) == 1:
+                    call = waiting[0][0]
+                elif self.store.db.execute("SELECT 1 FROM interaction_requests WHERE session_id=? AND resolved_at IS NULL AND kind='waiting_user' LIMIT 1", (sid,)).fetchone():
+                    return  # An untyped repeated notice does not invent another question.
+            self.store.open_interaction(sid, call or "visible-" + notification, 0, kind if call else "unknown", at, name or "", False, "hook")
+        elif event in ["PostToolUse", "PostToolUseFailure"] and call:
+            rows = self.store.db.execute("SELECT asynchronous FROM interaction_requests WHERE session_id=? AND call_id=? AND resolved_at IS NULL", (sid, call)).fetchall()
+            if rows and not any(row["asynchronous"] for row in rows):
+                self.store.resolve_interaction(sid, call, at)
+        if event == "Stop" and doc.get("stop_reason") not in ["cancelled", "interrupted", "aborted", "error"]:
+            self.store.complete(sid, at)
+
     def codex(self, doc, cursor, fallback_sid=None):
         if not isinstance(doc, dict):
             return cursor.get("sid")
@@ -155,6 +284,7 @@ class RecordParser:
             return sid
         if kind == "turn_context":
             self.store.metadata(sid, payload.get("cwd"))
+        self.codex_attention(doc, sid)
         if kind != "event_msg":
             return sid  # response text, tool arguments and results are discarded here.
         event = payload.get("type")
@@ -175,8 +305,11 @@ class RecordParser:
             self.store.state(sid, "unknown", "最近阶段：调用工具", at)
         elif event in ["exec_command_end", "mcp_tool_call_end"]:
             self.store.state(sid, "unknown", "最近阶段：工具返回", at)
-        elif event in ["exec_approval_request", "apply_patch_approval_request", "request_user_input"]:
-            self.store.state(sid, "waiting_user" if event == "request_user_input" else "waiting_approval", "等待你回复" if event == "request_user_input" else "等待你批准", at)
+        elif event in ["exec_approval_request", "apply_patch_approval_request", "request_user_input", "request_user_input_async"]:
+            question = event in ["request_user_input", "request_user_input_async"]
+            self.store.state(sid, "active" if event == "request_user_input_async" else "waiting_user" if question else "waiting_approval", "问题已发出 · 继续处理" if event == "request_user_input_async" else "等待你回复" if question else "等待你批准", at)
+            if not question:
+                self.store.open_interaction(sid, safe_id(payload.get("call_id")) or "unidentified-approval", 0, "unknown", at, "", False, "record")
         elif event in ["context_compacted", "context_compaction_started"]:
             self.store.invalidate_context(sid, at)
             self.store.state(sid, "unknown", "上下文已压缩 · 等待下一次快照", at)
@@ -359,6 +492,7 @@ class RecordParser:
             # IDE hosts repeat question dialogs as untyped permission notices.
             # Keep the precise type and original age, including after a restart.
             states[event] = None
+        self.lifecycle_attention(sid, doc, at, superseded)
         if states.get(event) and not superseded:
             if at >= current["state_at"]:
                 if states[event][0] == "waiting_user" and doc.get("tool_name") in ["AskUserQuestion", "ExitPlanMode"]:
@@ -394,6 +528,8 @@ class RecordParser:
     def lifecycle(self, doc, cursor):
         if not isinstance(doc, dict) or doc.get("agentwatch") != 1:
             return None
+        if doc.get("tool") == "cursor":
+            return collect_cursor(self.store, doc)
         tool, event = doc.get("tool"), doc.get("event")
         if tool not in LIFECYCLE_EVENTS or event not in LIFECYCLE_EVENTS[tool]:
             return None
@@ -431,6 +567,7 @@ class RecordParser:
             superseded = bool(turn and self.store.db.execute("SELECT 1 FROM hook_closed WHERE session_id=? AND kind='turn' AND source_id=?", (sid, turn)).fetchone())
         if event in ["PreToolUse", "PermissionRequest"] and tool_id:
             superseded |= self.store.db.execute("SELECT 1 FROM hook_closed WHERE session_id=? AND kind='tool' AND source_id=?", (sid, tool_id)).fetchone() is not None
+        self.lifecycle_attention(sid, doc, at, superseded)
         states = {"SessionStart": ("unknown", "已接入 · 等待状态事件"),
                   "UserPromptSubmit": ("active", "正在处理你的需求"), "PreToolUse": ("active", "调用工具"),
                   "PostToolUse": ("active", "工具返回 · 继续处理"), "PermissionRequest": ("waiting_approval", "等待你批准"),
@@ -439,9 +576,9 @@ class RecordParser:
                   "PostToolUseFailure": ("active", "工具失败 · Agent 可继续处理"),
                   "PreCompact": ("active", "压缩上下文"), "PostCompact": ("active", "上下文压缩完成"),
                   "SubagentStart": ("active", "子 Agent 正在工作"), "SubagentStop": ("idle", "子 Agent 本轮已结束")}
-        name = (doc.get("tool_name") or "").rsplit(".", 1)[-1]
+        name = self.question_tool(doc.get("tool_name")) or (doc.get("tool_name") or "").rsplit(".", 1)[-1]
         if event in ["PreToolUse", "PermissionRequest"] and (name in ["AskUserQuestion", "ExitPlanMode", "request_user_input", "request_user_input_async"] or name.endswith("__request_user_input")):
-            states[event] = ("waiting_user", "等待你确认方案" if name == "ExitPlanMode" else "等待你回复")
+            states[event] = ("active", "问题已发出 · 继续处理") if name == "request_user_input_async" else ("waiting_user", "等待你确认方案" if name == "ExitPlanMode" else "等待你回复")
         if event == "SessionStart" and doc.get("source") == "compact":
             states[event] = ("active", "上下文压缩完成 · 继续处理")
         elif event == "SessionStart" and row["state_source"] in ["hook", "event"] and row["state"] in ["active", "waiting_user", "waiting_approval"] and at - row["state_at"] < 120:
@@ -484,6 +621,8 @@ class RecordParser:
             if at >= row["state_at"] and row["liveness"] == "offline":
                 self.store.update(sid, {"liveness": "unknown"})
             self.store.state(sid, *state, at, "event", fingerprint("workbuddy-state:" + sid + str(at) + signal))
+        if signal == "TURN_COMPLETED" and target == "idle":
+            self.store.complete(sid, at)
         return sid
 
     def workbuddy(self, doc, cursor, fallback_sid=None):
@@ -556,11 +695,12 @@ class RecordParser:
 
 
 class Collector:
-    def __init__(self, store, codex_home, claude_home, data_dir, desktop_home=None, workbuddy_home=None):
+    def __init__(self, store, codex_home, claude_home, data_dir, desktop_home=None, workbuddy_home=None, cursor_home=None):
         self.store, self.parser = store, RecordParser(store)
         self.codex_home, self.claude_home, self.data_dir = Path(codex_home), Path(claude_home), Path(data_dir)
         self.desktop_home = Path(desktop_home) if desktop_home else Path.home() / "Library/Application Support/Claude"
         self.workbuddy_home = Path(workbuddy_home) if workbuddy_home else Path.home() / ".workbuddy"
+        self.cursor_home = Path(cursor_home) if cursor_home else Path.home() / ".cursor"
         self.stop_event = threading.Event()
         self.wake = threading.Event()
         self.thread = None
@@ -637,8 +777,9 @@ class Collector:
                 with closing(sqlite3.connect(index.as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
                     db.row_factory = sqlite3.Row
                     cols = {r[1] for r in db.execute("PRAGMA table_info(threads)")}
-                    wanted = [c for c in ["id", "rollout_path", "cwd", "source", "originator", "cli_version", "git_branch", "created_at", "created_at_ms", "archived", "thread_source"] if c in cols]
+                    wanted = [c for c in ["id", "rollout_path", "cwd", "source", "originator", "cli_version", "git_branch", "created_at", "created_at_ms", "archived", "thread_source", "title"] if c in cols]
                     rows = db.execute("SELECT " + ",".join(wanted) + " FROM threads").fetchall()
+                    names = read_codex_names(self.codex_home, db)
                     self.codex_index_sessions = {safe_id(row["id"]) for row in rows if safe_id(row["id"])}
                     self.codex_index_available = True
                     with self.store.lock, self.store.db:
@@ -656,6 +797,16 @@ class Collector:
                             role = "child" if isinstance(src, dict) and "subagent" in src else "main" if isinstance(src, str) and src in ["vscode", "cli", "exec", "appServer"] else "unknown"
                             surface = surface_for(r.get("originator") or "")
                             values = {"surface": surface} if surface != "unknown" else {}
+                            previous = self.store.db.execute("SELECT session_title_source FROM sessions WHERE id=?", (sid,)).fetchone()
+                            if source_id in names.titles:
+                                values.update(session_title=names.titles[source_id], session_title_source="session_index")
+                            elif not names.titles_failed and "title" in r and previous["session_title_source"] != "session_index":
+                                # Legacy clients only; a known sidebar name must
+                                # never fall back to an older first-message title.
+                                values.update(session_title=r["title"], session_title_source="thread_index")
+                            project_covered, project_title = names.project_title(source_id, r.get("cwd"))
+                            if project_covered:
+                                values["project_display_name"] = project_title
                             if "source" in r or "thread_source" in r:
                                 values["internal"] = int(internal_codex(src, r.get("thread_source")))
                             if r.get("archived") in (0, 1):
@@ -769,6 +920,71 @@ class Collector:
                 if row and (archived or row["archive_source"] != "index"):
                     self.store.update(sid, {"archived": int(archived), "archive_source": "path"})
 
+    def read_codex_attention(self, path, st, fallback_sid, budget):
+        """Versioned metadata replay, separate from usage/state cursors and baselines."""
+        inode = str(st.st_dev) + ":" + str(st.st_ino)
+        with self.store.lock:
+            saved = self.store.db.execute("SELECT * FROM attention_files WHERE path=?", (path,)).fetchone()
+            offset = saved["offset"] if saved else 0
+            sid = (saved["session_id"] if saved else None) or fallback_sid
+            ignored = bool(saved["ignore_prefix"]) if saved else False
+            partial = bool(saved and saved["complete"] == -1)
+        if saved and (saved["version"] != 1 or saved["inode"] != inode or st.st_size < offset):
+            offset, ignored, partial = 0, False, False
+        if saved and offset == st.st_size:
+            return 0, False
+        start, rows = offset, []
+        with Path(path).open("rb") as stream:
+            stream.seek(offset)
+            while stream.tell() - start < budget:
+                pos = stream.tell()
+                raw = stream.readline(2_000_001)
+                if not raw:
+                    break
+                if not raw.endswith(b"\n"):
+                    if len(raw) > 2_000_000:
+                        while raw and not raw.endswith(b"\n"):
+                            raw = stream.readline(2_000_001)
+                        if raw.endswith(b"\n"):
+                            offset = stream.tell()
+                            partial = True
+                            continue
+                    stream.seek(pos)
+                    break
+                offset = stream.tell()
+                try:
+                    rows.append(json.loads(raw))
+                except (ValueError, UnicodeError):
+                    partial = True
+                    continue
+        with self.store.lock, self.store.db:
+            if sid:
+                self.store.update(sid, {"attention_covered": 0})
+            for doc in rows:
+                payload = doc.get("payload") if isinstance(doc, dict) else None
+                if not isinstance(payload, dict):
+                    partial = True
+                    continue
+                if doc.get("type") == "session_meta":
+                    identity = safe_id(payload.get("id"))
+                    ignored = "chrome" in str(payload.get("originator", "")).lower() or bool(fallback_sid and identity != fallback_sid.partition(":")[2])
+                    if not ignored and identity:
+                        sid = fallback_sid or self.store.session("codex", identity)
+                        self.store.update(sid, {"attention_covered": 0})
+                if sid and not ignored:
+                    if (doc.get("type") == "response_item" or (doc.get("type") == "event_msg" and payload.get("type") == "task_complete")) and timestamp(doc.get("timestamp")) is None:
+                        partial = True
+                    self.parser.codex_attention(doc, sid)
+            complete = offset == st.st_size
+            coverage = -1 if partial else int(complete)
+            self.store.db.execute("""INSERT INTO attention_files VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(path) DO UPDATE SET inode=excluded.inode,offset=excluded.offset,version=excluded.version,
+                session_id=excluded.session_id,complete=excluded.complete,ignore_prefix=excluded.ignore_prefix""",
+                (path, inode, offset, 1, sid, coverage, int(ignored)))
+            if sid and complete:
+                self.store.update(sid, {"attention_covered": int(not partial)})
+        return offset - start, not complete
+
     def read_file(self, path, tool, fallback_sid, budget=512_000):
         if tool == "workbuddy" and not self.permitted_workbuddy(path):
             return 0, False
@@ -781,11 +997,14 @@ class Collector:
             return 0, False
         inode = str(st.st_dev) + ":" + str(st.st_ino)
         saved = self.store.file(path)
+        metadata_amount, metadata_more = (0, False)
+        if tool == "codex":
+            metadata_amount, metadata_more = self.read_codex_attention(path, st, fallback_sid or (saved["session_id"] if saved else None), budget)
         offset, data = (saved["offset"], json.loads(saved["data"])) if saved else (0, {})
         if saved and (saved["inode"] != inode or st.st_size < offset):
             offset = 0  # Keep the baseline and usage keys; replay must not increase totals.
         if st.st_size == offset:
-            return 0, False
+            return metadata_amount, metadata_more
         if fallback_sid and not data.get("sid"):
             data["sid"] = fallback_sid
         if tool == "claude" and p.parent.name == "subagents":
@@ -851,7 +1070,7 @@ class Collector:
                     spool.truncate(0)
                     with self.store.lock, self.store.db:
                         self.store.save_file(path, tool, None, inode, 0, {}, current.st_mtime, 0)
-        return amount, offset < st.st_size
+        return amount + metadata_amount, offset < st.st_size or metadata_more
 
     def probe(self):
         inventory = process_inventory()

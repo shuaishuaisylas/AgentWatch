@@ -31,6 +31,8 @@ def jump(session, kind, runner=subprocess.run):
         command = ["open", "-a", "Claude"]
     elif kind == "workbuddy" and session["tool"] == "workbuddy":
         command = ["open", "-a", "WorkBuddy"]
+    elif kind == "cursor" and session["tool"] == "cursor":
+        command = ["open", "-a", "Cursor"]
     elif kind == "project" and session["tool"] == "claude" and session.get("cwd"):
         command = ["open", "-a", "Visual Studio Code", session["cwd"]]
     elif kind == "terminal" and session.get("tty") and session.get("liveness") == "online":

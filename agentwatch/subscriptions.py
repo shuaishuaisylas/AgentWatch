@@ -13,6 +13,7 @@ import urllib.request
 from pathlib import Path
 
 from .common import now, safe_id, timestamp
+from .cursor_quota import cursor_platform
 
 STALE_SECONDS = 900
 WORKBUDDY_CREDIT_URL = "https://www.workbuddy.cn/openapi/v2/credit"
@@ -203,7 +204,10 @@ class Subscriptions:
             if self._workbuddy_snapshot:
                 rows.append(dict(self._workbuddy_snapshot))
         platforms = []
-        for tool, name in [("codex", "Codex"), ("claude", "Claude Code"), ("workbuddy", "WorkBuddy")]:
+        for tool, name in [("codex", "Codex"), ("claude", "Claude Code"), ("workbuddy", "WorkBuddy"), ("cursor", "Cursor")]:
+            if tool == "cursor":
+                platforms.append(cursor_platform(rows, current=current, demo=self.demo))
+                continue
             limits, updated = [], None
             for row in rows:
                 if row["tool"] != tool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -23,7 +24,8 @@ class Store:
               id TEXT PRIMARY KEY, tool TEXT NOT NULL, source_id TEXT NOT NULL,
               surface TEXT DEFAULT 'unknown', project_id TEXT DEFAULT 'unknown', project_name TEXT DEFAULT '未识别项目',
               cwd TEXT DEFAULT '', worktree TEXT DEFAULT '', branch TEXT DEFAULT '', version TEXT DEFAULT '',
-              role TEXT DEFAULT 'unknown', parent_id TEXT, alias TEXT DEFAULT '',
+              role TEXT DEFAULT 'unknown', parent_id TEXT, alias TEXT DEFAULT '', session_title TEXT,
+              project_display_name TEXT, session_title_source TEXT NOT NULL DEFAULT '',
               started_at REAL, last_event_at REAL, state TEXT DEFAULT 'unknown', stage TEXT DEFAULT '等待状态数据',
               state_at REAL DEFAULT 0, state_source TEXT DEFAULT 'record', liveness TEXT DEFAULT 'unknown',
               pid INTEGER, process_birth TEXT, tty TEXT, context_used INTEGER, context_limit INTEGER, context_at REAL,
@@ -64,8 +66,34 @@ class Store:
             CREATE TABLE IF NOT EXISTS hook_closed (
               session_id TEXT, kind TEXT, source_id TEXT, at REAL, PRIMARY KEY(session_id,kind,source_id)
             );
+            CREATE TABLE IF NOT EXISTS cursor_generations (
+              session_id TEXT PRIMARY KEY, generation_id TEXT NOT NULL, at REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS claude_pending_interactions (
               session_id TEXT PRIMARY KEY, tool_name TEXT NOT NULL, tool_use_id TEXT, at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS interaction_requests (
+              session_id TEXT NOT NULL, call_id TEXT NOT NULL, item_index INTEGER NOT NULL,
+              tool_name TEXT NOT NULL, kind TEXT NOT NULL, asynchronous INTEGER NOT NULL DEFAULT 0,
+              opened_at REAL NOT NULL, updated_at REAL NOT NULL, resolved_at REAL, source TEXT NOT NULL,
+              PRIMARY KEY(session_id,call_id,item_index)
+            );
+            CREATE TABLE IF NOT EXISTS interaction_aliases (
+              session_id TEXT NOT NULL, alias_id TEXT NOT NULL, call_id TEXT NOT NULL,
+              PRIMARY KEY(session_id,alias_id)
+            );
+            CREATE TABLE IF NOT EXISTS attention_dismissals (
+              session_id TEXT NOT NULL, call_id TEXT NOT NULL, item_index INTEGER NOT NULL,
+              opened_at REAL NOT NULL, dismissed_at REAL NOT NULL,
+              PRIMARY KEY(session_id,call_id,item_index)
+            );
+            CREATE TABLE IF NOT EXISTS attention_files (
+              path TEXT PRIMARY KEY, inode TEXT NOT NULL, offset INTEGER NOT NULL DEFAULT 0,
+              version INTEGER NOT NULL DEFAULT 1, session_id TEXT, complete INTEGER NOT NULL DEFAULT 0,
+              ignore_prefix INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS completion_receipts (
+              session_id TEXT PRIMARY KEY, read_completed_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS subscription_snapshots (
@@ -78,7 +106,12 @@ class Store:
         for name, declaration in [("archived", "INTEGER NOT NULL DEFAULT 0"),
                                   ("archive_source", "TEXT NOT NULL DEFAULT ''"),
                                   ("internal", "INTEGER NOT NULL DEFAULT 0"),
-                                  ("internal_memory", "INTEGER NOT NULL DEFAULT 0")]:
+                                  ("internal_memory", "INTEGER NOT NULL DEFAULT 0"),
+                                  ("last_completed_at", "REAL"),
+                                  ("attention_covered", "INTEGER NOT NULL DEFAULT 0"),
+                                  ("session_title", "TEXT"),
+                                  ("project_display_name", "TEXT"),
+                                  ("session_title_source", "TEXT NOT NULL DEFAULT ''")]:
             if name not in columns:
                 self.db.execute("ALTER TABLE sessions ADD COLUMN " + name + " " + declaration)
         self.db.executescript("""
@@ -86,6 +119,9 @@ class Store:
             CREATE INDEX IF NOT EXISTS sessions_role_activity ON sessions(role,last_event_at);
             CREATE INDEX IF NOT EXISTS sessions_role_liveness ON sessions(role,liveness);
             CREATE INDEX IF NOT EXISTS files_session ON files(tool,session_id);
+            CREATE INDEX IF NOT EXISTS interactions_open ON interaction_requests(session_id,resolved_at);
+            CREATE INDEX IF NOT EXISTS attention_files_session ON attention_files(session_id,complete);
+            CREATE INDEX IF NOT EXISTS sessions_completed ON sessions(role,last_completed_at);
             DROP VIEW IF EXISTS visible_sessions;
             CREATE VIEW visible_sessions AS
               WITH RECURSIVE hidden(id) AS (
@@ -107,7 +143,7 @@ class Store:
         if not source_id:
             return None
         sid = tool + ":" + source_id
-        self.db.execute("INSERT OR IGNORE INTO sessions(id,tool,source_id,seen_at) VALUES(?,?,?,?)", (sid, tool, source_id, now()))
+        self.db.execute("INSERT OR IGNORE INTO sessions(id,tool,source_id,seen_at,attention_covered) VALUES(?,?,?,?,1)", (sid, tool, source_id, now()))
         return sid
 
     def update(self, sid, values):
@@ -117,8 +153,15 @@ class Store:
             "process_birth", "tty", "context_used", "context_limit", "context_at", "context_estimated", "context_invalid_at",
             "reported_input", "reported_output", "reported_cache_read", "reported_cache_write", "reported_total",
             "coverage", "last_hook_at", "seen_at", "archived", "archive_source", "internal", "internal_memory",
+            "last_completed_at", "attention_covered", "session_title", "project_display_name", "session_title_source",
         }
         values = {k: v for k, v in values.items() if k in allowed}
+        for key in ("session_title", "project_display_name"):
+            if key in values:
+                # Existing client names only; never infer names from content.
+                values[key] = short_text(values[key], limit=160) or None
+        if "session_title_source" in values:
+            values["session_title_source"] = values["session_title_source"] if values["session_title_source"] in ("session_index", "thread_index") else ""
         if values:
             self.db.execute("UPDATE sessions SET " + ",".join(k + "=?" for k in values) + " WHERE id=?", (*values.values(), sid))
 
@@ -148,6 +191,178 @@ class Store:
         if changed:
             key = event_id or fingerprint(sid + state + stage + str(at))
             self.db.execute("INSERT OR IGNORE INTO activity VALUES(?,?,?,?,?)", (key, sid, at, state, stage))
+
+    def complete(self, sid, at):
+        """Explicit completed-turn evidence only; idle and process exit never call this."""
+        self.db.execute("UPDATE sessions SET last_completed_at=MAX(COALESCE(last_completed_at,0),?) WHERE id=?", (at, sid))
+
+    def acknowledge_completion(self, sid, completed_at, current=None):
+        current = now() if current is None else current
+        if (isinstance(completed_at, bool) or not isinstance(completed_at, (int, float)) or
+                not math.isfinite(completed_at) or not 0 < completed_at <= current):
+            return False
+        row = self.db.execute("SELECT last_completed_at FROM visible_sessions WHERE id=? AND role='main'", (sid,)).fetchone()
+        if not row or row["last_completed_at"] is None or completed_at > row["last_completed_at"]:
+            return False
+        # A click on an older version never acknowledges a later completion.
+        self.db.execute("""INSERT INTO completion_receipts VALUES(?,?) ON CONFLICT(session_id)
+            DO UPDATE SET read_completed_at=MAX(completion_receipts.read_completed_at,excluded.read_completed_at)""", (sid, completed_at))
+        return True
+
+    def completion_inbox(self, card, attention, current):
+        completed = card.get("last_completed_at")
+        eligible = (card.get("role") == "main" and completed is not None and
+                    current - 86400 <= completed <= current and card["state"] in ["idle", "ended"] and
+                    not attention["pending"] and not attention["unknown"])
+        receipt = self.db.execute("SELECT read_completed_at FROM completion_receipts WHERE session_id=?", (card["id"],)).fetchone()
+        unread = eligible and (not receipt or receipt["read_completed_at"] < completed)
+        return {"unread_completed": bool(unread), "completed_at": completed}
+
+    def open_interaction(self, sid, call_id, item_index, kind, at,
+                         tool_name="request_user_input_async", asynchronous=True, source="event"):
+        """Store correlation metadata only: no question, answer or tool argument."""
+        if (not safe_id(call_id) or isinstance(item_index, bool) or not isinstance(item_index, int)
+                or not 0 <= item_index < 64 or kind not in ["waiting_user", "waiting_approval", "unknown"]):
+            return False
+        self.db.execute("""INSERT INTO interaction_requests VALUES(?,?,?,?,?,?,?,?,NULL,?)
+            ON CONFLICT(session_id,call_id,item_index) DO UPDATE SET
+              kind=CASE WHEN interaction_requests.kind='unknown' THEN excluded.kind ELSE interaction_requests.kind END,
+              tool_name=CASE WHEN excluded.tool_name!='' THEN excluded.tool_name ELSE interaction_requests.tool_name END,
+              asynchronous=MAX(interaction_requests.asynchronous,excluded.asynchronous),
+              opened_at=MIN(interaction_requests.opened_at,excluded.opened_at),
+              updated_at=MAX(interaction_requests.updated_at,excluded.updated_at)""",
+            (sid, call_id, item_index, tool_name, kind, int(asynchronous), at, at, source))
+        self.touch(sid, at)
+        return True
+
+    def interaction_alias(self, sid, alias_id, call_id):
+        if safe_id(alias_id) and safe_id(call_id):
+            # A conflicting source identity must never be reassigned to another call.
+            self.db.execute("INSERT OR IGNORE INTO interaction_aliases VALUES(?,?,?)", (sid, alias_id, call_id))
+
+    def resolve_interaction(self, sid, call_id, at, item_index=None, tool_name=None):
+        if not safe_id(call_id):
+            return 0
+        alias = self.db.execute("SELECT call_id FROM interaction_aliases WHERE session_id=? AND alias_id=?", (sid, call_id)).fetchone()
+        if alias:
+            if alias[0] != call_id and self.db.execute("SELECT 1 FROM interaction_requests WHERE session_id=? AND call_id=? LIMIT 1", (sid, call_id)).fetchone():
+                return 0  # Conflicting correlation identities cannot safely close either call.
+            call_id = alias[0]
+        clauses, values = ["session_id=?", "call_id=?", "opened_at<=?"], [sid, call_id, at]
+        if item_index is not None:
+            if isinstance(item_index, bool) or not isinstance(item_index, int) or not 0 <= item_index < 64:
+                return 0
+            clauses.append("item_index=?"); values.append(item_index)
+        if tool_name is not None:
+            clauses.append("tool_name=?"); values.append(tool_name)
+        result = self.db.execute("UPDATE interaction_requests SET resolved_at=COALESCE(resolved_at,?),updated_at=MAX(updated_at,?) WHERE " + " AND ".join(clauses), (at, at, *values))
+        return result.rowcount
+
+    def attention_summaries(self, root_ids, current):
+        """One metadata pass plus explicit visible child edges; no truncated-card sums."""
+        related = {root_id: [root_id] for root_id in root_ids}
+        for offset in range(0, len(root_ids), 160):
+            for row in self.descendant_rows(root_ids[offset:offset + 160], "s.id"):
+                related[row["root_id"]].append(row["id"])
+        requested = {sid for ids in related.values() for sid in ids}
+        summaries = self.own_attention(requested, current)
+        requests = {}
+        for row in self.open_attention_requests(requested, current):
+            requests.setdefault(row["session_id"], []).append(row)
+        result = {}
+        for root_id, ids in related.items():
+            items = [summaries[sid] for sid in ids if sid in summaries]
+            result[root_id] = self.merge_attention(items)
+            pending = [row for sid in ids for row in requests.get(sid, [])]
+            result[root_id]["dismiss_version"] = self.attention_version(root_id, pending)
+        return result
+
+    def open_attention_requests(self, session_ids, current):
+        """Current human reminders; dismissal never rewrites actual resolution."""
+        rows, session_ids = [], list(session_ids)
+        for offset in range(0, len(session_ids), 160):
+            batch = session_ids[offset:offset + 160]
+            if not batch:
+                continue
+            rows.extend(self.db.execute("""SELECT i.session_id,i.call_id,i.item_index,
+                i.opened_at,i.kind,i.tool_name FROM interaction_requests i
+                LEFT JOIN attention_dismissals d ON d.session_id=i.session_id AND d.call_id=i.call_id
+                    AND d.item_index=i.item_index AND d.opened_at=i.opened_at
+                WHERE i.session_id IN (""" + ",".join("?" for _ in batch) + """)
+                    AND i.resolved_at IS NULL AND i.opened_at<=?
+                    AND i.kind IN ('waiting_user','waiting_approval') AND d.session_id IS NULL""",
+                (*batch, current)).fetchall())
+        return rows
+
+    @staticmethod
+    def attention_version(root_id, requests):
+        if not requests:
+            return None
+        identities = sorted((r["session_id"], r["call_id"], r["item_index"], r["opened_at"],
+                             r["kind"], r["tool_name"]) for r in requests)
+        return fingerprint(json.dumps([root_id, identities], separators=(",", ":")))
+
+    def dismiss_attention(self, sid, version, current=None):
+        """Explicit user reconciliation of this exact batch, never an Agent answer."""
+        current = now() if current is None else current
+        if (not safe_id(sid) or not isinstance(version, str) or len(version) != 64
+                or any(c not in "0123456789abcdef" for c in version)):
+            return False
+        with self.lock, self.db:
+            if not self.db.execute("SELECT 1 FROM visible_sessions WHERE id=? AND role='main'", (sid,)).fetchone():
+                return False
+            ids = [sid] + [r["id"] for r in self.descendant_rows([sid], "s.id")]
+            requests = self.open_attention_requests(ids, current)
+            if self.attention_version(sid, requests) != version:
+                return False
+            self.db.executemany("""INSERT INTO attention_dismissals VALUES(?,?,?,?,?)
+                ON CONFLICT(session_id,call_id,item_index) DO UPDATE SET
+                    opened_at=excluded.opened_at,dismissed_at=excluded.dismissed_at""",
+                [(r["session_id"], r["call_id"], r["item_index"], r["opened_at"], current) for r in requests])
+        return True
+
+    @staticmethod
+    def merge_attention(items):
+        values = {key: sum(item[key] for item in items) for key in ["waiting_user", "waiting_approval", "error", "unknown"]}
+        values["pending"] = values["waiting_user"] + values["waiting_approval"] > 0
+        times = [item["oldest_at"] for item in items if item["oldest_at"] is not None]
+        values["oldest_at"] = min(times) if times else None
+        return values
+
+    def own_attention(self, session_ids, current):
+        result = {}
+        session_ids = list(session_ids)
+        for offset in range(0, len(session_ids), 160):
+            batch = session_ids[offset:offset + 160]
+            if not batch:
+                continue
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.db.execute("SELECT id,state,state_at,coverage,attention_covered FROM sessions WHERE id IN (" + placeholders + ")", batch).fetchall()
+            for row in rows:
+                result[row["id"]] = {"pending": False, "waiting_user": 0, "waiting_approval": 0,
+                    "error": int(row["state"] == "error"), "unknown": int(not row["attention_covered"] or row["coverage"] in ["partial_records", "missing_time"]), "oldest_at": None}
+            for row in self.db.execute("""SELECT i.session_id,i.kind,COUNT(*) AS n,MIN(i.opened_at) AS oldest
+                FROM interaction_requests i LEFT JOIN attention_dismissals d
+                  ON d.session_id=i.session_id AND d.call_id=i.call_id AND d.item_index=i.item_index
+                    AND d.opened_at=i.opened_at
+                WHERE i.session_id IN (""" + placeholders + """) AND i.resolved_at IS NULL AND i.opened_at<=?
+                  AND (d.session_id IS NULL OR i.kind='unknown') GROUP BY i.session_id,i.kind""", (*batch, current)):
+                item = result[row["session_id"]]
+                item[row["kind"]] += row["n"]
+                item["oldest_at"] = min(item["oldest_at"] or row["oldest"], row["oldest"])
+            for row in rows:
+                item = result[row["id"]]
+                reconciled = self.db.execute("""SELECT 1 FROM attention_dismissals d
+                    JOIN interaction_requests i ON i.session_id=d.session_id AND i.call_id=d.call_id
+                      AND i.item_index=d.item_index AND i.opened_at=d.opened_at
+                    WHERE d.session_id=? AND d.dismissed_at>=? LIMIT 1""", (row["id"], row["state_at"] or 0)).fetchone()
+                # Legacy waiting is not sufficient evidence that a person is needed.
+                if not reconciled and row["state"] in ["waiting_user", "waiting_approval", "unknown"] and not any(item[key] for key in ["waiting_user", "waiting_approval", "unknown"]):
+                    item["unknown"] = 1
+                if self.db.execute("SELECT 1 FROM attention_files WHERE session_id=? AND complete!=1 LIMIT 1", (row["id"],)).fetchone():
+                    item["unknown"] = max(1, item["unknown"])
+                item["pending"] = item["waiting_user"] + item["waiting_approval"] > 0
+        return result
 
     def context(self, sid, used, limit, at, estimated=False):
         row = self.db.execute("SELECT context_at,context_invalid_at FROM sessions WHERE id=?", (sid,)).fetchone()
@@ -282,6 +497,10 @@ class Store:
     def session_card(self, row, current):
         """The same safe metadata and conservative state for roots and descendants."""
         card = self.card_state(row, current)
+        card["session_title"] = short_text(card.get("session_title"), limit=160) or None
+        card["project_display_name"] = short_text(card.get("project_display_name"), limit=160) or None
+        card["attention"] = self.own_attention([card["id"]], current)[card["id"]]
+        card["inbox"] = self.completion_inbox(card, card["attention"], current)
         card["context_stale"] = card["context_at"] is not None and current - card["context_at"] > 300
         observed = self.db.execute("SELECT SUM(input) AS i,SUM(output) AS o,SUM(cache_read) AS cr,SUM(cache_write) AS cw,SUM(total) AS total FROM usage WHERE session_id=?", (card["id"],)).fetchone()
         today = self.db.execute("SELECT SUM(total) FROM usage WHERE session_id=? AND day=?", (card["id"], day_of(current))).fetchone()[0]
@@ -302,7 +521,7 @@ class Store:
         if card["tool"] == "codex" and card["last_hook_at"] and not self.db.execute(
                 "SELECT 1 FROM files WHERE tool='codex' AND session_id=? AND offset>0 LIMIT 1", (card["id"],)).fetchone():
             card["coverage"] = "status_only"
-        for key in ["cwd", "worktree", "pid", "process_birth", "tty", "reported_input", "reported_output", "reported_cache_read", "reported_cache_write", "reported_total", "archived", "archive_source", "internal", "internal_memory"]:
+        for key in ["cwd", "worktree", "pid", "process_birth", "tty", "reported_input", "reported_output", "reported_cache_read", "reported_cache_write", "reported_total", "archived", "archive_source", "internal", "internal_memory", "attention_covered", "session_title_source"]:
             card.pop(key, None)
         return card
 
@@ -366,7 +585,11 @@ class Store:
                 # midnight. Seed from indexed activity, then follow explicit known
                 # parent edges upward; hidden and unknown paths stop traversal.
                 rows = self.db.execute("""WITH RECURSIVE recent_children(id,parent_id,role) AS (
-                    SELECT id,parent_id,role FROM sessions WHERE role='child' AND last_event_at>=?
+                    SELECT id,parent_id,role FROM sessions WHERE role='child' AND (last_event_at>=?
+                      OR EXISTS(SELECT 1 FROM interaction_requests i WHERE i.session_id=sessions.id
+                        AND i.resolved_at IS NULL AND i.kind IN ('waiting_user','waiting_approval')
+                        AND NOT EXISTS(SELECT 1 FROM attention_dismissals d WHERE d.session_id=i.session_id
+                          AND d.call_id=i.call_id AND d.item_index=i.item_index AND d.opened_at=i.opened_at)))
                       AND archived=0 AND internal=0 AND internal_memory=0
                     UNION
                     SELECT id,parent_id,role FROM sessions WHERE role='child' AND liveness='online'
@@ -379,20 +602,31 @@ class Store:
                         AND p.archived=0 AND p.internal=0 AND p.internal_memory=0
                     ) SELECT s.* FROM visible_sessions s WHERE """ + where + """
                       AND (s.last_event_at>=? OR s.liveness='online'
+                        OR EXISTS(SELECT 1 FROM interaction_requests i WHERE i.session_id=s.id
+                          AND i.resolved_at IS NULL AND i.kind IN ('waiting_user','waiting_approval')
+                          AND NOT EXISTS(SELECT 1 FROM attention_dismissals d WHERE d.session_id=i.session_id
+                            AND d.call_id=i.call_id AND d.item_index=i.item_index AND d.opened_at=i.opened_at))
+                        OR (s.last_completed_at>=? AND s.last_completed_at<=? AND NOT EXISTS(
+                            SELECT 1 FROM completion_receipts r WHERE r.session_id=s.id AND r.read_completed_at>=s.last_completed_at))
                         OR s.id IN (SELECT id FROM ancestors WHERE role='main'))
-                    ORDER BY s.last_event_at DESC""", (start.timestamp(), *values, start.timestamp())).fetchall()
+                    ORDER BY s.last_event_at DESC""", (start.timestamp(), *values, start.timestamp(), current - 86400, current)).fetchall()
             else:
                 rows = self.db.execute("SELECT s.* FROM visible_sessions s WHERE " + where + " AND (s.last_event_at>=? OR s.liveness='online') ORDER BY s.last_event_at DESC", (*values, start.timestamp())).fetchall()
             priority = {"waiting_approval": 0, "waiting_user": 0, "error": 1, "active": 2, "unknown": 3, "idle": 4, "ended": 5}
             cards = [self.session_card(row, current) for row in rows]
             summaries = self.children_summaries([card["id"] for card in cards if card["role"] == "main"], current)
+            attentions = self.attention_summaries([card["id"] for card in cards if card["role"] == "main"], current)
             children_counts = {key: sum(summary[key] for summary in summaries.values())
                                for key in ["total", "active", "waiting", "error", "unknown"]}
             for card in cards:
                 if card["id"] in summaries:
                     card["children_summary"] = summaries[card["id"]]
+                    card["attention"] = attentions[card["id"]]
+                    card["inbox"] = self.completion_inbox(card, card["attention"], current)
             def card_priority(card):
                 rank = priority.get(card["state"], 3)
+                if card["attention"]["pending"]:
+                    rank = 0
                 summary = card.get("children_summary", {})
                 for key, child_rank in [("waiting", 0), ("error", 1), ("active", 2), ("unknown", 3)]:
                     if summary.get(key):
@@ -402,11 +636,30 @@ class Store:
             activity = [dict(r) for r in self.db.execute("SELECT a.id,a.at,a.kind,a.label,s.tool,s.source_id,s.project_name,s.id AS session_id FROM activity a JOIN visible_sessions s ON s.id=a.session_id WHERE " + where + " AND a.at>=? AND a.at<? ORDER BY a.at DESC LIMIT 24", (*values, start.timestamp(), end.timestamp()))]
             projects = [dict(r) for r in self.db.execute("SELECT s.project_id AS id,s.project_name AS name,COUNT(*) AS sessions FROM sessions s WHERE s.internal_memory=0 OR EXISTS (SELECT 1 FROM usage u WHERE u.session_id=s.id) GROUP BY s.project_id,s.project_name ORDER BY s.project_name")]
             unknown_roles = self.db.execute("SELECT COUNT(*) FROM visible_sessions WHERE role='unknown' AND last_event_at>=?", (start.timestamp(),)).fetchone()[0]
+            recent_where, recent_values = self.select_filter(dict(args, role="main"))
+            recent_rows = self.db.execute("SELECT s.* FROM visible_sessions s WHERE " + recent_where + " AND s.last_completed_at>=? AND s.last_completed_at<=? ORDER BY s.last_completed_at DESC,s.id", (*recent_values, current - 86400, current)).fetchall()
+            recent_completed = []
+            for row in recent_rows:
+                card = self.session_card(row, current)
+                card["attention"] = self.attention_summaries([card["id"]], current)[card["id"]]
+                card["inbox"] = self.completion_inbox(card, card["attention"], current)
+                if not card["inbox"]["unread_completed"]:
+                    continue
+                recent_completed.append(card)
+                if len(recent_completed) == 5:
+                    break
         counts = self.state_counts(cards)
         counts["observed"] = counts.pop("total")
         counts.update(online=sum(c["liveness"] == "online" for c in cards), unknown_roles=unknown_roles)
+        attention_counts = {key: sum(bool(item[key]) for item in attentions.values()) for key in ["pending", "waiting_user", "waiting_approval", "error", "unknown"]}
+        roots = [card for card in cards if card["role"] == "main"]
+        inbox_counts = {"pending": sum(card["attention"]["pending"] or card["inbox"]["unread_completed"] for card in roots),
+                        "action_required": attention_counts["pending"],
+                        "unread_completed": sum(card["inbox"]["unread_completed"] for card in roots),
+                        "unknown": attention_counts["unknown"]}
         return {"now": current, "date": day_of(current), "timezone": "Asia/Shanghai", "counts": counts,
                 "children_counts": children_counts, "sessions": cards[:160],
+                "attention_counts": attention_counts, "inbox_counts": inbox_counts, "recent_completed": recent_completed,
                 "truncated": len(cards) > 160, "activity": activity, "projects": projects, "scan": scan_status,
                 "today": self.stats(dict(args, period="day", date=day_of(current)), current)}
 
@@ -424,6 +677,8 @@ class Store:
         return None
 
     def jump_info(self, card):
+        if card["tool"] == "cursor":
+            return {"kind": "cursor", "label": "打开 Cursor", "precision": "应用", "available": True}
         if card["tool"] == "workbuddy":
             return {"kind": "workbuddy", "label": "打开 WorkBuddy", "precision": "应用", "available": True}
         if card["tool"] == "codex":

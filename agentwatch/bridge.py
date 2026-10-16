@@ -75,6 +75,8 @@ def sanitize(doc, statusline=False, process=None, at=None):
     notification = doc.get("notification_type")
     if notification in ["permission_prompt", "idle_prompt", "agent_needs_input"]:
         row["notification_type"] = notification
+    if doc.get("stop_reason") in ["completed", "cancelled", "interrupted", "aborted", "error"]:
+        row["stop_reason"] = doc["stop_reason"]
     if process:
         row.update(pid=process["pid"], process_birth=process["birth"], tty=process["tty"], surface=process["surface"])
     if statusline:
