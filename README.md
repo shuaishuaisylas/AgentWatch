@@ -7,7 +7,7 @@
 面向 macOS，需有 Python 3.9 及以上。无需安装 Python 第三方依赖，也没有 npm 安装或前端构建步骤。
 
 ```sh
-git clone --branch codex/desktop-capsule https://github.com/shuaishuaisylas/AgentWatch.git
+git clone https://github.com/shuaishuaisylas/AgentWatch.git
 cd AgentWatch
 python3 -m agentwatch --demo --port 8767 --open
 ```
@@ -16,7 +16,7 @@ python3 -m agentwatch --demo --port 8767 --open
 
 前端与后端由同一个 Python 服务提供。不要直接双击 `web/index.html`，也不要另起静态服务器或 Vite 来连接本地 API；页面需要同源 cookie 和 CSRF 校验。修改 `web/` 后刷新页面即可。Node.js 仅用于可选的 JavaScript 语法检查，不是运行依赖。
 
-协作前按顺序阅读 [AGENTS.md](AGENTS.md)、[交接说明](docs/HANDOFF.md)、[API 约定](docs/API.md)。[协作指南](docs/CONTRIBUTING.md) 提供拉取当前功能分支、创建个人分支、验收和可直接交给开发 Agent 的开工指令。后端主要在 `agentwatch/`，Web 前端在 `web/`，macOS 胶囊在 `desktop/`。默认分支在 PR 合并前不包含当前功能，接手时先核对分支。
+共同开发以 `main` 为基线，本批胶囊与 Cursor 功能通过 [PR #2](https://github.com/shuaishuaisylas/AgentWatch/pull/2) 合入；合并记录与状态以该 PR 为准，不依赖旧交接中的功能分支或提交号。协作前按顺序阅读 [AGENTS.md](AGENTS.md)、[交接说明](docs/HANDOFF.md)、[API 约定](docs/API.md)。[协作指南](docs/CONTRIBUTING.md) 提供从 `origin/main` 创建独立 `codex/<task>` 分支、验收和可直接交给开发 Agent 的开工指令。后端主要在 `agentwatch/`，Web 前端在 `web/`，macOS 胶囊在 `desktop/`。
 
 ## 使用真实本机数据
 
@@ -39,7 +39,7 @@ macOS 原生客户端位于 `desktop/`，复用同一本机 API，不依赖浏�
 ./desktop/scripts/run-demo.sh
 ```
 
-真实模式先启动看板服务，再双击 `启动胶囊.command`。仅大于零的“执行”和“待处理”会显示；都没有时自动隐去，有新活动后重新出现，手动暂隐仍优先。详情支持可靠完成的已读确认与人工提醒的本地消除；不替用户回复或批准。更多操作及安全重启见 [桌面说明](desktop/README.md)，当前实现与验收边界见 [桌面交接](docs/DESKTOP_CAPSULE_CURRENT_HANDOFF.md)。
+真实模式先启动看板服务，再双击 `启动胶囊.command`。仅大于零的“执行”和“待处理”会显示；无任务时文字留空，胶囊与额度描边仍保持可见、可点击，方便调试和查看详情。可通过菜单手动暂隐，手动暂隐仍优先。详情支持可靠完成的已读确认与人工提醒的本地消除；不替用户回复或批准。更多操作及安全重启见 [桌面说明](desktop/README.md)，当前实现与验收边界见 [桌面交接](docs/DESKTOP_CAPSULE_CURRENT_HANDOFF.md)。
 
 ## 第一版能做什么
 

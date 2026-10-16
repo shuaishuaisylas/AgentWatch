@@ -86,7 +86,7 @@ struct LifecycleCheck {
             try verifySessionCardCallbacks(nextTo: delegate.panel)
             try verifySessionNames(nextTo: delegate.panel)
             try verifyScrollVisibility(nextTo: delegate.panel)
-            try verifyAutomaticVisibility(delegate)
+            try verifyPersistentVisibility(delegate)
 
             try menu("暂隐胶囊", action: #selector(AppDelegate.hide), delegate: delegate)
             settle()
@@ -145,7 +145,8 @@ struct LifecycleCheck {
             settle()
             try require(delegate.controller.suspended, "Registered sleep observers suspend the controller")
             try require(!delegate.details.isVisible, "Sleep observer closes details")
-            try require(!delegate.panel.isVisible, "Sleep hides the capsule instead of showing an update placeholder")
+            try require(delegate.panel.isVisible && delegate.capsule.text.stringValue.isEmpty,
+                        "Suspension preserves the debugging capsule without stale count labels")
             try require(!delegate.controller.actionBusy, "Sleep releases an interrupted action lock")
             try require(delegate.controller.actionMessage?.contains("未确认") == true, "Interrupted action stays explicitly unconfirmed")
             try require(!delegate.controller.status.fresh, "Suspended state cannot be presented as fresh")
@@ -169,7 +170,7 @@ struct LifecycleCheck {
             try require(delegate.panel.isVisible && !delegate.panel.isKeyWindow && !delegate.panel.isMainWindow, "Recovery menu remains usable after hidden wake")
 
             print("Lifecycle integration passed: \(checks) checks; artificial probe only.")
-            print("Verified automatic activity visibility, manual-hide priority, menu wiring, three detail groups, whole-card action reuse, saved position, shine, and simulated sleep/wake notifications.")
+            print("Verified persistent debugging visibility, manual-hide priority, menu wiring, three detail groups, whole-card action reuse, saved position, shine, and simulated sleep/wake notifications.")
         } catch let error as Failure {
             // Throwing out of the do block still runs window and preference cleanup.
             fputs("Lifecycle integration failed: \(error.message)\n", stderr)
@@ -186,7 +187,7 @@ struct LifecycleCheck {
     }
 
     private static var exitAfterCleanup = false
-    private static func verifyAutomaticVisibility(_ delegate: AppDelegate) throws {
+    private static func verifyPersistentVisibility(_ delegate: AppDelegate) throws {
         // The probe's timer normally refreshes its synthetic timestamp. Pause it
         // while testing stale/error input so it cannot accidentally mask either.
         let timerDate = delegate.timer?.fireDate
@@ -221,59 +222,72 @@ struct LifecycleCheck {
             delegate.render()
             settle(seconds: 0.04)
         }
-        func hiddenWithoutContent(_ message: String) throws {
-            try require(!delegate.panel.isVisible && !delegate.details.isVisible, message)
+        func visibleWithoutContent(_ message: String) throws {
+            try require(delegate.panel.isVisible, message)
             try require(delegate.controller.status.text.isEmpty, "No activity produces no status label")
             try require(!delegate.controller.status.hasContent, "No activity is not visible capsule content")
             try require(delegate.capsule.text.stringValue.isEmpty && (delegate.capsule.accessibilityLabel() ?? "").isEmpty,
                         "Empty content clears the actual label, demo prefix, and accessible label")
-            try require(!delegate.capsule.isPressed && !delegate.capsule.isDragging,
-                        "Automatic hiding resets unfinished pointer gestures")
-            try require(delegate.capsule.shine.animation(forKey: "shine") == nil, "An automatically hidden capsule never animates")
+            try require(!delegate.panel.isKeyWindow && !delegate.panel.isMainWindow,
+                        "The persistent empty capsule stays non-key and non-main")
+            try require(delegate.capsule.shine.animation(forKey: "shine") == nil,
+                        "Empty debugging content never shows execution shine")
         }
 
+        delegate.closeDetails()
         delegate.capsule.isPressed = true; delegate.capsule.isDragging = true
         apply(fixture())
-        try hiddenWithoutContent("Known zero counts hide both windows and the quota outline")
+        try visibleWithoutContent("Known zero counts retain the debugging capsule")
+        try require(delegate.capsule.isPressed && delegate.capsule.isDragging,
+                    "An ordinary zero-state update does not cancel an in-progress drag")
+        delegate.capsule.isPressed = false; delegate.capsule.isDragging = false
         try require(delegate.capsule.used.strokeEnd > 0,
-                    "A valid selected quota cannot keep an empty capsule shell visible")
+                    "A selected valid quota remains on the empty debugging capsule")
         try require(delegate.controller.status.active == 0 && delegate.controller.status.pending == 0,
-                    "Hiding known zero does not change the count semantics")
+                    "Omitting zero labels does not change the count semantics")
         try require(!delegate.controller.hidden && !delegate.preferences.bool(forKey: "hidden"),
-                    "Automatic hiding never creates a persistent user hide")
+                    "Ordinary state updates do not create a persistent user hide")
+        try require(!delegate.details.isVisible, "A zero-state update does not automatically open details")
+        delegate.toggleDetails()
+        let unchangedZero = delegate.controller.snapshot
+        apply(unchangedZero, age: 16)
+        let staleZeroLabels = delegate.details.stack.arrangedSubviews.compactMap { ($0 as? NSTextField)?.stringValue }
+        try require(delegate.details.isVisible && staleZeroLabels.contains("状态待更新"),
+                    "Age alone refreshes the debugging warning even when zero-count text and snapshot are unchanged")
+        delegate.closeDetails()
+        apply(unchangedZero)
 
         apply(fixture(unknown: 3, inboxUnknown: 2))
-        try hiddenWithoutContent("Unknown-only state does not display a confirmation placeholder")
+        try visibleWithoutContent("Unknown-only state keeps the capsule without a confirmation placeholder")
         try require(delegate.controller.status.pending == nil && delegate.controller.status.hasCoverageGap,
-                    "Hidden coverage gaps remain unknown rather than becoming zero")
+                    "Coverage gaps remain unknown rather than becoming zero")
         delegate.toggleDetails()
-        try require(!delegate.details.isVisible, "No-content capsule cannot open empty details")
+        try require(delegate.details.isVisible, "Unknown-only debugging capsule can open details explicitly")
+        let unknownLabels = delegate.details.stack.arrangedSubviews.compactMap { ($0 as? NSTextField)?.stringValue }
+        try require(unknownLabels.contains("部分状态待确认") && unknownLabels.contains("待处理状态待确认"),
+                    "Unknown-only details explain the missing coverage")
+        delegate.closeDetails()
         try menu("显示胶囊", action: #selector(AppDelegate.show), delegate: delegate)
-        try hiddenWithoutContent("Show menu cannot force an unknown-only capsule into view")
+        try visibleWithoutContent("Show menu retains an unknown-only debugging capsule")
+        try require(!delegate.details.isVisible, "Show does not automatically open empty-state details")
         apply(fixture(includeInbox: false))
-        try hiddenWithoutContent("Missing inbox coverage does not manufacture a visible zero or confirmation label")
+        try visibleWithoutContent("Missing inbox coverage keeps the capsule without zero or confirmation labels")
 
         apply(fixture(active: 1, unknown: 2, inboxUnknown: 1))
         try require(delegate.panel.isVisible && delegate.controller.status.text == "1 执行",
-                    "Confirmed execution automatically restores one positive label")
+                    "Confirmed execution restores one positive label on the persistent capsule")
         try require(delegate.capsule.text.stringValue == "演示 · 1 执行" &&
                     !(delegate.capsule.accessibilityLabel() ?? "").contains("待确认"),
                     "Actual rendered content has only the positive activity label")
         try require(delegate.controller.status.pending == nil && delegate.controller.status.hasCoverageGap,
                     "Visible execution does not turn unknown pending into a zero label")
         try require(!delegate.details.isVisible && !delegate.panel.isKeyWindow && !delegate.panel.isMainWindow,
-                    "Automatic reappearance neither opens details nor takes keyboard focus")
-        guard let lateRelease = NSEvent.mouseEvent(with: .leftMouseUp, location: NSPoint(x: 20, y: 20),
-            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
-            windowNumber: delegate.panel.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 0)
-            else { throw Failure(message: "Cannot construct the artificial cancelled release") }
-        delegate.capsule.mouseUp(with: lateRelease)
-        try require(!delegate.details.isVisible,
-                    "A release from a gesture cancelled by hiding cannot open details after recovery")
+                    "New positive counts neither open details nor take keyboard focus")
         delegate.toggleDetails()
         let detailLabels = delegate.details.stack.arrangedSubviews.compactMap { ($0 as? NSTextField)?.stringValue }
         try require(detailLabels.contains("部分状态待确认") && detailLabels.contains("待处理状态待确认"),
                     "Explicit details retain the coverage explanation hidden from the capsule")
+        delegate.closeDetails()
 
         apply(fixture(pending: 2, unknown: 1, inboxUnknown: 1))
         try require(delegate.panel.isVisible && delegate.controller.status.text == "2 待处理",
@@ -284,24 +298,45 @@ struct LifecycleCheck {
         try require(delegate.panel.isVisible && delegate.controller.status.text == "3 执行 · 2 待处理",
                     "Both confirmed categories remain visible alongside unknown coverage")
         apply(fixture(childActive: 7, errors: 5))
-        try hiddenWithoutContent("Child execution and ordinary errors do not invent main activity")
+        try visibleWithoutContent("Child execution and ordinary errors keep an empty debugging capsule without inventing main activity")
+        try require(!delegate.details.isVisible, "Ordinary updates never open the detail window")
 
         apply(fixture(active: 2, pending: 1))
         delegate.toggleDetails()
-        try require(delegate.details.isVisible, "Activity details can reopen after automatic recovery")
+        try require(delegate.details.isVisible, "Activity details can be opened explicitly")
         apply(delegate.controller.snapshot, error: "人工读取失败")
-        try hiddenWithoutContent("A failed refresh hides stale activity and closes details")
+        try visibleWithoutContent("A failed refresh preserves the debugging capsule without stale activity labels")
+        try require(delegate.details.isVisible,
+                    "A failed refresh preserves details the user already opened for debugging")
+        let failureLabels = delegate.details.stack.arrangedSubviews.compactMap { ($0 as? NSTextField)?.stringValue }
+        try require(failureLabels.contains("状态待更新"), "Explicit debugging details explain a failed refresh")
         try require(delegate.controller.snapshot?.counts.active == 2,
                     "Failed refresh retains the previous snapshot without presenting it as current")
+        delegate.closeDetails()
         apply(fixture(active: 2), age: 16)
-        try hiddenWithoutContent("Expired state hides the capsule without an update placeholder")
+        try visibleWithoutContent("Expired state preserves the debugging capsule without an update placeholder")
+        try require(!delegate.details.isVisible, "Expired state does not automatically open debugging details")
+        delegate.toggleDetails()
+        try require(delegate.details.isVisible, "Expired observations remain accessible through explicit debugging details")
+        let expiredLabels = delegate.details.stack.arrangedSubviews.compactMap { ($0 as? NSTextField)?.stringValue }
+        try require(expiredLabels.contains("状态待更新"), "Explicit debugging details identify an expired observation")
+        delegate.closeDetails()
         apply(nil)
-        try hiddenWithoutContent("Missing initial state shows no connecting capsule")
+        try visibleWithoutContent("Missing initial state retains the debugging capsule without connecting text")
+        try require(!delegate.details.isVisible, "Missing data does not automatically open details")
+        delegate.toggleDetails()
+        try require(delegate.details.isVisible, "Missing initial data still permits explicit debugging details")
+        let connectingLabels = delegate.details.stack.arrangedSubviews.compactMap { ($0 as? NSTextField)?.stringValue }
+        try require(connectingLabels.contains("正在连接…"), "Explicit debugging details explain a missing first observation")
+        delegate.closeDetails()
         apply(fixture(active: 2))
         try require(delegate.panel.isVisible && !delegate.details.isVisible,
-                    "A fresh later observation restores only the capsule")
+                    "A fresh later observation leaves details closed until another explicit click")
 
+        delegate.capsule.isPressed = true; delegate.capsule.isDragging = true
         try menu("暂隐胶囊", action: #selector(AppDelegate.hide), delegate: delegate)
+        try require(!delegate.capsule.isPressed && !delegate.capsule.isDragging,
+                    "Manual hiding cancels unfinished pointer gestures")
         apply(fixture())
         apply(fixture(active: 4, pending: 3))
         try require(!delegate.panel.isVisible && !delegate.details.isVisible && delegate.controller.hidden,
@@ -311,14 +346,24 @@ struct LifecycleCheck {
         try require(delegate.preferences.bool(forKey: "hidden"), "Manual hiding retains its saved preference")
         apply(fixture())
         try menu("显示胶囊", action: #selector(AppDelegate.show), delegate: delegate)
-        try hiddenWithoutContent("Show with no activity clears the override without displaying an empty capsule")
+        try visibleWithoutContent("Show with no activity restores the empty debugging capsule")
         try require(!delegate.controller.hidden && !delegate.preferences.bool(forKey: "hidden"),
-                    "Show re-enables future automatic appearances")
+                    "Show explicitly clears the user's hide preference")
+        guard let lateRelease = NSEvent.mouseEvent(with: .leftMouseUp, location: NSPoint(x: 20, y: 20),
+            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: delegate.panel.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 0)
+            else { throw Failure(message: "Cannot construct the artificial cancelled release") }
+        delegate.capsule.mouseUp(with: lateRelease)
+        try require(!delegate.details.isVisible,
+                    "A release from a gesture cancelled by manual hiding cannot open details after showing")
+        try menu("暂隐胶囊", action: #selector(AppDelegate.hide), delegate: delegate)
         try menu("重置位置", action: #selector(AppDelegate.reset), delegate: delegate)
-        try hiddenWithoutContent("Reset position with no activity does not force a visible quota shell")
+        try visibleWithoutContent("Reset position with no activity restores the empty debugging capsule")
+        try require(!delegate.controller.hidden && contained(delegate.panel.frame),
+                    "Reset clears manual hiding and restores an on-screen debugging entry")
         apply(fixture(pending: 1))
         try require(delegate.panel.isVisible && !delegate.panel.isKeyWindow && !delegate.panel.isMainWindow,
-                    "New pending activity reappears after the user explicitly re-enables showing")
+                    "New pending counts retain the non-activating persistent capsule")
     }
 
     private static func verifySessionCardCallbacks(nextTo capsule: NSPanel) throws {

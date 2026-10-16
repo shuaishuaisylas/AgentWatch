@@ -6,12 +6,12 @@ AgentWatch 的代码可以共同开发，真实会话、账号和配置留在各
 
 先读 [AGENTS.md](../AGENTS.md)、[最新交接](HANDOFF.md)、[API 约定](API.md)，再查看相关源码。涉及胶囊时，另读 [当前桌面交接](DESKTOP_CAPSULE_CURRENT_HANDOFF.md) 与 [桌面运行说明](../desktop/README.md)。交接保留了历史记录，以顶部最新状态为准。
 
-本批功能在 `codex/desktop-capsule`，尚未合并；`main` 没有胶囊和 Cursor 的这批最新功能。维护者确认已推送后，从功能分支开始：
+共同开发以 `main` 为基线。本批胶囊与 Cursor 功能通过 [PR #2](https://github.com/shuaishuaisylas/AgentWatch/pull/2) 合入，合并记录与状态以该 PR 为准；不要依据旧交接中的功能分支或提交号开工。新克隆默认取得 `main`，每项任务再从 `origin/main` 创建独立分支：
 
 ```sh
-git clone --branch codex/desktop-capsule https://github.com/shuaishuaisylas/AgentWatch.git
+git clone https://github.com/shuaishuaisylas/AgentWatch.git
 cd AgentWatch
-git switch -c codex/your-change
+git switch -c codex/your-change origin/main
 ```
 
 最后一行换成自己的变更分支名。已有工作区先检查 `git status`、当前分支与 remote，再 fetch 并保留改动；不要重置、清理或覆盖其他人的工作。直接向原仓库推送前，由仓库 owner 邀请协作者并赋予 Write 权限；无写权限时可使用 fork 提交 PR。本文不代表邀请、权限或分支保护已经配置，不需要交换 Agent 平台账号。
@@ -51,7 +51,7 @@ python3 -m agentwatch --demo --port 8767 --open
 
 开工时说明本次负责范围。前端需要新字段时，先说明名称、类型、可空性、单位及兼容方式；接口改变同时更新 API 文档、调用方、人工样例与测试。优先增加兼容字段，不顺手改写其他平台的采集、配置或导航。
 
-保留这些语义：未知值不是零，在线不是执行，未知角色不归为主会话，缓存/推理分项不重复计入总量，跳转遵循服务端提供的精度。胶囊执行只计明确主会话，待处理使用独立根会话并集；无确认执行或待处理时隐去，未知数据仍保留。详细规则以 [API](API.md) 为准。
+保留这些语义：未知值不是零，在线不是执行，未知角色不归为主会话，缓存/推理分项不重复计入总量，跳转遵循服务端提供的精度。胶囊执行只计明确主会话，待处理使用独立根会话并集；仅正数显示执行／待处理文字，无任务时文字留空，胶囊与额度描边仍保持可见、可点击，方便调试。手动暂隐仍优先，未知数据不补零。详细规则以 [API](API.md) 为准。
 
 ## 每台机器独立接入
 
@@ -87,12 +87,12 @@ git diff --check
 CI 中的 Python、JavaScript 与 Swift 核心/控制器检查用于代码回归；原生窗口、透明材质、焦点及真实客户端行为仍需在自己的 Mac 验收，不能用自动检查替代。
 
 - Web 变更：用演示检查工具筛选、空态、主会话/子 Agent 详情、年度热力图、接入禁用与窄屏。
-- 胶囊变更：检查执行/待处理、无内容隐去与新活动恢复、手动暂隐优先、不抢焦点，以及受影响的点击、已读、右键与额度行为。
+- 胶囊变更：检查正数执行/待处理文字、无任务时文字留空但胶囊与额度仍可见可点击、手动暂隐优先、不抢焦点，以及受影响的点击、已读、右键与额度行为。
 - 来源、hooks 或跳转变更：人工回归后，按实际客户端版本与入口单独验收，记录未覆盖项。配置保存、收到一次事件、编译或 CI 通过都不等于完整真实验收。参考 [客户端验收](CLIENT_ACCEPTANCE.md) 与 [桌面验收记录](../desktop/ACCEPTANCE.md)。
 
 ## 用小分支与 PR 交付
 
-一项变更一个 `codex/` 分支，避免多人直接推同一功能分支。依赖尚未合并功能时，先与维护者确认集成分支与 PR 基线；之后以实际合并状态更新，不根据旧交接猜测。
+一项变更一个从最新 `origin/main` 创建的 `codex/<task>` 分支，避免多人直接推同一分支，不直接向 `main` 提交或推送。依赖尚未合并功能时，先与维护者确认集成分支与 PR 基线；之后以实际合并状态更新，不根据旧交接猜测。
 
 按 [PR 模板](../.github/pull_request_template.md) 写清问题、改后行为、涉及范围、实际验证与剩余限制。只提交本次负责的改动，审阅暂存内容，确认没有本机数据；不要强制覆盖他人分支或擅自合并 PR。许可证尚未指定，不自行添加许可证或更换框架。
 
@@ -103,16 +103,16 @@ CI 中的 Python、JavaScript 与 Swift 核心/控制器检查用于代码回归
 ```text
 请在我自己的 AgentWatch checkout 中完成下面的任务。
 目标仓库：https://github.com/shuaishuaisylas/AgentWatch
-本批功能基线：origin/codex/desktop-capsule，尚未合并，main 没有这批最新功能。
+共同开发基线：origin/main。本批功能的合并记录见 https://github.com/shuaishuaisylas/AgentWatch/pull/2；开工时核对远程最新状态。
 本次任务：[由用户填写具体目标、负责范围和验收要求]
 
 以用户当前任务为准。先只读检查 git status --short、git branch --show-current、git remote -v，确认 remote 对应目标仓库后再 git fetch origin。
 有本地改动或未跟踪文件，先记录范围并报告，保留它们，不覆盖、不自动 stash、不混入本次提交。不盲目 checkout，不运行 reset --hard 或 clean。需要切换时，只有确认不会影响已有工作才继续；否则先做可独立完成的只读检查并说明阻碍。
-从已 fetch 的 origin/codex/desktop-capsule 创建自己的 codex/任务名分支。例如 git switch -c codex/your-task origin/codex/desktop-capsule；示例分支名须换成本次任务名，已存在时先核对用途。不要误用 sylas 等他人现有分支，不直接向 main 或共享功能分支提交、推送。
+从已 fetch 的 origin/main 创建自己的 codex/任务名分支。例如 git switch -c codex/your-task origin/main；示例分支名须换成本次任务名，已存在时先核对用途。不要误用 sylas 等他人现有分支，不直接向 main 或共享分支提交、推送。
 
 按顺序读 AGENTS.md、docs/HANDOFF.md 顶部最新状态、docs/API.md；桌面任务再读 docs/DESKTOP_CAPSULE_CURRENT_HANDOFF.md、desktop/README.md，验收记录看末尾。不要按历史“未实现”记录重做现有功能。
 Web/接口开发先用 python3 -m agentwatch --demo --port 8767 --open；胶囊使用 ./desktop/scripts/run-demo.sh。演示只用人工临时来源，不接真实目录，不改真实 hooks，不打开真实 Agent。页面通过 Python 同源服务访问，保留 cookie/CSRF，不另起前端服务绕过校验。
-按约定分工修改 backend、web 或 desktop；接口变化同步 docs/API.md、调用端、人工样例与测试。未知不补零，进程在线不当执行，角色未知不当主会话；胶囊执行与待处理保持独立，跳转服从精度。Cursor 官网额度只是显式读取的页面快照，不是自动实时余额。
+按约定分工修改 backend、web 或 desktop；接口变化同步 docs/API.md、调用端、人工样例与测试。未知不补零，进程在线不当执行，角色未知不当主会话；胶囊执行与待处理保持独立，仅显示正数文字，无任务时文字留空但胶囊与额度保持可见可点击，手动暂隐仍优先。跳转服从精度。Cursor 官网额度只是显式读取的页面快照，不是自动实时余额。
 
 运行相关 Python 全套、node --check web/app.js 与 git diff --check；胶囊变更再运行 desktop/scripts/test.sh、test-transport.sh、test-controller-read.sh 和 test-lifecycle.sh --build-only。窗口行为另用人工演示验收；--build-only 不能写成窗口通过。退出胶囊后才运行窗口检查或构建，不停止未知进程。
 记录工具缺失、未执行项目与未知边界。真实 hooks、信任、回复/批准及跳转按客户端版本和入口分别验收；不代替用户操作，不更改批准策略。不得提交真实会话、数据库、凭据、配置备份或个人截图。

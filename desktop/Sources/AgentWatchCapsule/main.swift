@@ -118,7 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         quotaSelection.resolve(snapshot: controller.subscriptions, now: Date().timeIntervalSince1970)
         if previous != quotaSelection.identity { saveQuota() }
         let status = controller.status
-        let shouldShow = !controller.hidden && status.hasContent && !layoutProbe
+        let shouldShow = !controller.hidden && !layoutProbe
         if !shouldShow {
             panel.orderOut(nil)
             capsule.isPressed = false; capsule.isDragging = false
@@ -131,7 +131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if oldSize != panel.frame.size && !capsule.isPressed { positions.clamp(panel, snap: false) }
         if shouldShow && !panel.isVisible { panel.orderFrontRegardless() }
         if details.isVisible && !isTrackingMenu {
-            let signature = String(describing: controller.snapshot) + String(describing: controller.children) + String(describing: controller.subscriptions) + (controller.snapshotError ?? "") + (controller.subscriptionError ?? "") + String(controller.actionBusy) + (controller.childrenError ?? "") + (controller.actionMessage ?? "") + quota.description + status.text + (controller.selectedParent ?? "")
+            let signature = String(describing: controller.snapshot) + String(describing: controller.children) + String(describing: controller.subscriptions) + (controller.snapshotError ?? "") + (controller.subscriptionError ?? "") + String(controller.actionBusy) + (controller.childrenError ?? "") + (controller.actionMessage ?? "") + quota.description + status.text + String(status.fresh) + (controller.selectedParent ?? "")
             if signature != lastDetailsSignature { lastDetailsSignature = signature; renderDetails(quota: quota) }
         }
         updatePassthrough()
@@ -150,7 +150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func toggleDetails() {
         if details.isVisible { closeDetails(); return }
-        guard layoutProbe || (!controller.hidden && controller.status.hasContent) else { return }
+        guard layoutProbe || !controller.hidden else { return }
         controller.setDetailsVisible(true)
         lastDetailsSignature = ""
         let quota = QuotaPresentation.evaluate(snapshot: controller.subscriptions, selection: quotaSelection.identity, failed: controller.subscriptionError != nil, now: Date().timeIntervalSince1970)
@@ -161,7 +161,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func renderDetails(quota: QuotaPresentation) {
         let offset = details.beginUpdate()
         details.text(controller.expectDemo ? "人工演示 · 会话" : "会话", title: true)
-        if controller.snapshotError != nil { details.text("状态待更新", warning: true) }
+        if controller.snapshot == nil { details.text(controller.snapshotError == nil ? "正在连接…" : "状态待更新", warning: true) }
+        else if !controller.status.fresh { details.text("状态待更新", warning: true) }
         else if controller.status.hasCoverageGap { details.text("部分状态待确认", warning: true) }
         let groups = CapsuleDetailGroups.evaluate(snapshot: controller.snapshot, now: Date().timeIntervalSince1970)
         renderGroup("待回复 / 待批准", cards: groups.pending, completed: false,
@@ -285,7 +286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func toolName(_ tool: String) -> String { ["codex": "Codex", "claude": "Claude Code", "workbuddy": "WorkBuddy", "cursor": "Cursor"][tool] ?? tool }
     func sourceName(_ source: String?) -> String { guard let source else { return "来源未知" }; return ["hook": "状态上报", "event": "明确事件", "record": "本地记录", "process": "进程观测", "demo": "人工样例"][source] ?? source }
     @objc func show() { controller.hidden = false; preferences.set(false, forKey: "hidden"); controller.tick(force: true); render() }
-    @objc func hide() { closeDetails(); panel.orderOut(nil); capsule.stopAnimation(); controller.hidden = true; preferences.set(true, forKey: "hidden") }
+    @objc func hide() { closeDetails(); panel.orderOut(nil); capsule.isPressed = false; capsule.isDragging = false; capsule.stopAnimation(); controller.hidden = true; preferences.set(true, forKey: "hidden") }
     @objc func reset() { positions.reset(panel); show() }
     @objc func openDashboard() {
         guard !controller.probe, controller.snapshot != nil else { return }
